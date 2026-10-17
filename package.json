@@ -1,0 +1,25 @@
+{
+  "name": "alphastar-desktop-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Secure local API and SMTP verification service for the Alpha Star desktop app.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/staff-account-pin.js && node --check src/email-delivery.js && node --check src/scheduling-routes.js && node --check src/queue-routes.js && node --check src/account-service.js && node --check src/sync-routes.js && node --check src/smpe-routes.js",
+    "test": "node --test",
+    "renumber:queue-history": "node scripts/renumber-queue-history.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.4.0",
+    "nodemailer": "^10.1.2"
+  },
+  "overrides": {
+    "gaxios": { "uuid": "^11.1.1" },
+    "google-gax": { "uuid": "^11.1.1" },
+    "teeny-request": { "uuid": "^11.1.1" }
+  }
+}
