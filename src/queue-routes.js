@@ -140,16 +140,17 @@ function destinationKey(root, entry) {
 }
 
 function assertDestinationAvailable(root, entry, requestedStatus) {
-  const nextStatus = normalizeStatus(requestedStatus);
+  const nextStatus = requestedStatus === 'proceed_to_floor' ? 'called' : normalizeStatus(requestedStatus);
   const currentStatus = normalizeStatus(entry.status);
-  // A patient can wait, but cannot be called into or start in a room that is
-  // already serving another patient. Existing serving rows remain valid.
+  // Calling reserves this destination until service ends or the ticket is
+  // released. Different rooms/floors can continue independently.
   if (!['called', 'serving'].includes(nextStatus) || currentStatus === 'serving') return;
 
   const key = destinationKey(root, entry);
   if (!key) return;
   const occupied = Object.entries(root.queueEntries || {}).find(([id, other]) => {
-    if (id === entry.id || !other || other.deletedAt || normalizeStatus(other.status) !== 'serving') return false;
+    if (other === entry || id === entry.id || !other || other.deleted || other.deletedAt) return false;
+    if (!['called', 'serving'].includes(normalizeStatus(other.status)) && !(normalizeStatus(other.status) === 'waiting' && other.journeyStatus === 'proceed_to_floor')) return false;
     return destinationKey(root, other) === key;
   });
   if (!occupied) return;
@@ -189,9 +190,16 @@ function addQueueEntry(root, input, actor, now, id) {
   const timestamp = new Date(now).toISOString();
   const date = clinicDate(now);
   const uid = owner(input, appointment);
-  const existing = Object.values(root.queueEntries).find((entry) => entry && !entry.deletedAt && entryDate(entry, appointmentFor(root, entry)) === date && ACTIVE.has(normalizeStatus(entry.status)) && (
+  const clinicRecordId = input.clinicRecordId == null || input.clinicRecordId === "" ? "" : input.clinicRecordId;
+  const clinicProfile = clinicRecordId ? root.patientProfiles?.[clinicRecordId] : null;
+  if (clinicRecordId !== "" && (typeof clinicRecordId !== "string" || !/^clinic_[a-f0-9]{32}$/.test(clinicRecordId) || uid || appointment ||
+    !clinicProfile || clinicProfile.recordKind !== "clinic_only" || clinicProfile.recordId !== clinicRecordId || clinicProfile.userId || clinicProfile.deleted || clinicProfile.deletedAt || root.users?.[clinicRecordId])) {
+    throw new QueueError("Choose an existing clinic patient record without a mobile account.", 400, "QUEUE_PATIENT_RECORD_INVALID");
+  }
+  const existing = Object.values(root.queueEntries).find((entry) => entry && !entry.deleted && !entry.deletedAt && entryDate(entry, appointmentFor(root, entry)) === date && ACTIVE.has(normalizeStatus(entry.status)) && (
     (appointment && appointmentFor(root, entry)?.id === appointment.id) ||
-    ((!appointment || !entry.appointmentId) && uid && owner(entry, appointmentFor(root, entry)) === uid && clean(entry.serviceName).toLowerCase() === clean(appointment?.serviceName || input.serviceName).toLowerCase())
+    ((!appointment || !entry.appointmentId) && uid && owner(entry, appointmentFor(root, entry)) === uid && clean(entry.serviceName).toLowerCase() === clean(appointment?.serviceName || input.serviceName).toLowerCase()) ||
+    (clinicRecordId && !entry.userId && entry.clinicRecordId === clinicRecordId && clean(entry.serviceName).toLowerCase() === clean(input.serviceName).toLowerCase())
   ));
   if (existing) {
     if (appointment && !existing.appointmentId) {
@@ -206,8 +214,26 @@ function addQueueEntry(root, input, actor, now, id) {
   const entryId = safeId(id);
   if (root.queueEntries[entryId]) {
     const previous = root.queueEntries[entryId];
-    if (String(previous.appointmentId || "") === String(appointment?.id || "") && String(previous.userId || "") === uid) return { entry: previous, duplicate: true };
+    if (String(previous.appointmentId || "") === String(appointment?.id || "") && String(previous.userId || "") === uid && String(previous.clinicRecordId || "") === clinicRecordId) return { entry: previous, duplicate: true };
     throw new QueueError("This queue reference is already in use.", 409);
+  }
+  // A patient must finish/cancel an active visit before receiving another
+  // ticket, even for another service or when an older active ticket remains.
+  // Saved identities distinguish namesakes; free-text walk-ins use an exact
+  // normalized name check only, never automatic patient-record linking.
+  const requestedName = clean(input.patientName).toLowerCase();
+  const activePatient = Object.values(root.queueEntries).find(entry => {
+    if (!entry || entry.deleted || entry.deletedAt || !ACTIVE.has(normalizeStatus(entry.status))) return false;
+    if (uid) return !entry.clinicRecordId && owner(entry, appointmentFor(root, entry)) === uid;
+    if (clinicRecordId) return !entry.userId && entry.clinicRecordId === clinicRecordId;
+    return requestedName && clean(entry.patientName).toLowerCase() === requestedName;
+  });
+  if (activePatient) {
+    const reference = activePatient.queueNo ? ` (${activePatient.queueNo})` : "";
+    throw new QueueError(uid || clinicRecordId
+      ? `This patient already has an ongoing queue entry${reference}. Complete or cancel it before adding another.`
+      : `A patient with this name already has an ongoing queue entry${reference}. If this is a different patient, select their saved patient record.`,
+      409, "QUEUE_PATIENT_ALREADY_QUEUED");
   }
   const queueEntries = Object.values(root.queueEntries).filter((entry) => entry && !entry.deletedAt);
   const used = new Set(queueEntries.map((entry) => String(entry.queueNo || "")));
@@ -219,7 +245,7 @@ function addQueueEntry(root, input, actor, now, id) {
     while (used.has(`A-${String(number).padStart(3, "0")}`)) number += 1;
     queueNo = `A-${String(number).padStart(3, "0")}`;
   }
-  const profile = root.patientProfiles?.[uid] || root.users?.[uid] || {};
+  const profile = clinicProfile || root.patientProfiles?.[uid] || root.users?.[uid] || {};
   const estimate = input.estimatedWaitMinutes == null
     ? automaticWaitMinutes(root, input, appointment, now)
     : Number(input.estimatedWaitMinutes);
@@ -250,6 +276,7 @@ function addQueueEntry(root, input, actor, now, id) {
     sequence: Math.max(0, ...queueEntries.map((item) => Number(item.sequence || 0))) + 1,
     appointmentId: appointment?.id || appointmentRecordId || "", appointmentRecordId, appointmentNumber: appointment?.appointmentNumber || appointment?.ref || "",
     userId: uid, patientName: clean(appointment?.patientName || appointment?.guestName || profile.fullName || profile.name || input.patientName || "Patient"),
+    ...(clinicRecordId ? { clinicRecordId, patientNumber: clean(clinicProfile.patientNumber) } : {}),
     serviceName: clean(appointment?.serviceName || appointment?.reason || input.serviceName || "Clinic visit"),
     doctor: clean(appointment?.doctor || input.doctor || "Clinic team"),
     floor, room,

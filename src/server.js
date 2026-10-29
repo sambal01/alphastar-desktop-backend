@@ -9,6 +9,8 @@ const express = require("express");
 const { registerBookingRoutes } = require("./scheduling-routes");
 const { registerQueueRoutes, createStaffAccessGuard } = require("./queue-routes");
 const { registerSmpeRoutes } = require("./smpe-routes");
+const { registerPatientRecordRoutes } = require("./patient-record-routes");
+const { registerInventoryRoutes } = require("./inventory-routes");
 const { registerSyncRoutes } = require("./sync-routes");
 const { createPatientAuthenticatorAccess } = require("./patient-authenticator-access");
 const { accountType: desktopAccountType, requireAdministrator, createAccountService } = require("./account-service");
@@ -791,8 +793,9 @@ function accountVerificationOtpEmailHtml({
   return securityCodeEmailHtml({
     appLabel,
     code,
+    codeType: "verification",
     expiresLabel,
-    intro: "Use this one-time PIN code to verify the email address for your Alphastar desktop account.",
+    intro: "Use this one-time verification code to verify the email address for your Alphastar desktop account.",
     recipientName,
     title: "Verify your Alphastar account",
   });
@@ -1361,7 +1364,7 @@ function createRegistrationToken({ email, metadata = {}, purpose }) {
   return { expiresAt, token };
 }
 
-function consumeRegistrationToken({ email = "", purpose, token = "" }) {
+function consumeRegistrationToken({ email = "", purpose, token = "", expectedMetadata = {} }) {
   const store = readStore();
   cleanupChallenges(store);
   const tokenHash = securityKey("registration-token", token);
@@ -1378,6 +1381,10 @@ function consumeRegistrationToken({ email = "", purpose, token = "" }) {
     const error = new Error("This verified registration session is not valid for this email.");
     error.status = 401;
     throw error;
+  }
+
+  if (!Object.entries(expectedMetadata).every(([key, value]) => registrationToken.metadata?.[key] === value)) {
+    throw Object.assign(new Error("Verify this account's email again with the current administrator and account type."), { status: 401, code: "ACCOUNT_VERIFICATION_MISMATCH" });
   }
 
   if (new Date(registrationToken.expiresAt).getTime() <= Date.now()) {
@@ -3383,14 +3390,14 @@ function addAudit(actor, action, targetType, targetId, details = {}) {
 
 app.use(["/api/staff", "/api/staff-auth"], createStaffAccessGuard({ getFirebaseApp: firebaseAdminApp }));
 
-app.use(["/api/staff/accounts", "/api/staff-auth/account-verification", "/api/staff/clinic-settings"], (req, res, next) => {
+app.use(["/api/staff/accounts", "/api/staff/patient-accounts", "/api/staff-auth/account-verification", "/api/staff/clinic-settings"], (req, res, next) => {
   try { requireAdministrator(req.staffAccess); next(); }
   catch (error) { sendError(res, error); }
 });
 
 app.get("/api/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { staffAccountPin: 1, staffPinRecovery: 1 } });
+  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1 } });
 });
 
 app.post("/api/auth/account-status", async (req, res) => {
@@ -4072,12 +4079,43 @@ app.post("/api/staff-auth/email-change/verify", (req, res) => {
   }
 });
 
-// Older clients must not send emailed codes for new staff/admin accounts.
-for (const action of ["start", "verify"]) {
-  app.post("/api/staff-auth/account-verification/" + action, (_req, res) => {
-    res.status(410).json({ ok: false, error: "Account creation now uses Create PIN and Confirm PIN. Update the desktop app." });
-  });
-}
+// Email ownership is separate from the saved six-digit account PIN.
+app.post("/api/staff-auth/account-verification/start", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    requireAdministrator(req.staffAccess);
+    const actor = actorFromRequest(req), email = normalizeEmail(req.body.email);
+    const type = desktopAccountType(req.body.accountType || "staff");
+    if (!["admin", "staff", "doctor"].includes(type)) throw Object.assign(new Error("Choose Admin, Staff, or Doctor."), { status: 400 });
+    if (!isValidEmail(email)) throw Object.assign(new Error("Enter a valid account email address."), { status: 400 });
+    if (!emailReady()) throw emailUnavailableError();
+    if (await registeredDatabaseAccount(email, "staff")) throw Object.assign(new Error("Email is already registered in the Alpha Star desktop system."), { status: 409 });
+    const challenge = createChallenge({ email, purpose: accountVerificationPurpose, userId: actor.uid,
+      metadata: { adminUid: actor.uid, accountType: type } });
+    try {
+      await sendMail({ to: email, subject: "Verify your Alphastar account",
+        html: accountVerificationOtpEmailHtml({ code: challenge.code, recipientName: sanitizePlainText(req.body.name, 120) }),
+        text: `Your Alphastar account verification code is ${challenge.code}. It expires in ${challengeDurationLabel}. This is not your saved account PIN.` });
+    } catch (error) { forgetChallenge(challenge.challengeToken, "replaced"); throw error; }
+    res.json({ ok: true, challengeToken: challenge.challengeToken, expiresAt: challenge.expiresAt,
+      resendAfterSeconds: resendDelaySeconds, senderEmail: emailSender(), delivery: "email", message: "OTP sent. Check your inbox or spam folder." });
+  } catch (error) { sendError(res, error); }
+});
+
+app.post("/api/staff-auth/account-verification/verify", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    requireAdministrator(req.staffAccess);
+    const actor = actorFromRequest(req);
+    if (!isValidEmail(normalizeEmail(req.body.email))) throw Object.assign(new Error("Enter the account email being verified."), { status: 400 });
+    if (!/^\d{6}$/.test(String(req.body.code || ""))) throw Object.assign(new Error("Enter the complete 6-digit OTP."), { status: 400 });
+    const challenge = verifyChallenge({ challengeToken: String(req.body.challengeToken || ""), code: String(req.body.code),
+      email: normalizeEmail(req.body.email), purpose: accountVerificationPurpose, userId: actor.uid, requireUserId: true });
+    const registration = createRegistrationToken({ email: challenge.email, purpose: accountVerificationPurpose,
+      metadata: { adminUid: actor.uid, accountType: challenge.metadata.accountType } });
+    res.json({ ok: true, registrationToken: registration.token, registrationTokenExpiresAt: registration.expiresAt });
+  } catch (error) { sendError(res, error); }
+});
 
 function desktopAccounts() {
   const appInstance = firebaseAdminApp();
@@ -4174,16 +4212,19 @@ app.post("/api/staff/accounts/:userId/deletion-code", async (req, res) => {
 });
 
 app.post("/api/staff/accounts", async (req, res) => {
-  const actor = actorFromRequest(req);
+  res.set("Cache-Control", "no-store");
   const email = normalizeEmail(req.body.email);
   try {
+    requireAdministrator(req.staffAccess);
+    const actor = actorFromRequest(req);
     const service = desktopAccounts();
     const type = desktopAccountType(req.body.accountType || req.body.role || "staff");
     if (!isValidEmail(email)) return res.status(400).json({ ok: false, error: "Enter a valid email address." });
-    // Administrator-authenticated account creation sets a saved PIN, not an emailed code.
     const existingAccount = await registeredDatabaseAccount(email, "staff");
     if (existingAccount) return res.status(409).json({ ok: false, error: "Email is already registered in the Alpha Star desktop system." });
-    const result = await service.create({ ...req.body, email, accountType: type }, actor);
+    consumeRegistrationToken({ email, purpose: accountVerificationPurpose, token: String(req.body.registrationToken || ""),
+      expectedMetadata: { adminUid: actor.uid, accountType: type } });
+    const result = await service.create({ ...req.body, email, accountType: type }, actor, { emailVerified: true });
     let confirmationEmailSent = false;
     if (emailReady()) {
       try {
@@ -4208,6 +4249,95 @@ app.post("/api/staff/accounts", async (req, res) => {
         accountType: result.user.accountType,
         staff: result.staff,
         userId: result.user.userId,
+      },
+    });
+  } catch (error) { sendError(res, error); }
+});
+
+app.patch("/api/staff/patient-accounts/:userId/access", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    requireAdministrator(req.staffAccess);
+    const targetUid = normalizeUserId(req.params.userId);
+    if (!targetUid || !/^[A-Za-z0-9_-]{1,128}$/.test(targetUid)) {
+      throw Object.assign(new Error("Invalid patient account reference."), { status: 400 });
+    }
+    if (typeof req.body.enabled !== "boolean") {
+      throw Object.assign(new Error("Choose whether the patient account should be enabled or disabled."), { status: 400 });
+    }
+
+    const appInstance = firebaseAdminApp();
+    if (!appInstance) throw firebaseAdminRequiredError("change patient account access");
+    const database = getDatabase(appInstance);
+    const auth = getAuth(appInstance);
+    const [userSnapshot, profileSnapshot, authUser] = await Promise.all([
+      database.ref(`users/${targetUid}`).get(),
+      database.ref(`patientProfiles/${targetUid}`).get(),
+      auth.getUser(targetUid).catch((error) => {
+        if (error?.code === "auth/user-not-found") return null;
+        throw error;
+      }),
+    ]);
+    const user = userSnapshot.val();
+    const profile = profileSnapshot.val();
+    if (!authUser || (!user && !profile)) {
+      throw Object.assign(new Error("Patient account was not found. Refresh the list and try again."), { status: 404 });
+    }
+    const role = String(
+      user?.role || user?.accountRole || profile?.role || profile?.accountRole || "patient",
+    ).trim().toLowerCase();
+    if (role !== "patient") {
+      throw Object.assign(new Error("Only patient accounts can be changed from this directory."), { status: 400 });
+    }
+
+    const enabled = req.body.enabled;
+    const previousAuthDisabled = authUser.disabled === true;
+    const now = new Date().toISOString();
+    const actor = actorFromRequest(req);
+    await auth.updateUser(targetUid, { disabled: !enabled });
+    try {
+      const updates = {};
+      for (const collectionName of ["users", "patientProfiles"]) {
+        const exists = collectionName === "users" ? userSnapshot.exists() : profileSnapshot.exists();
+        if (!exists) continue;
+        updates[`${collectionName}/${targetUid}/accountStatus`] = enabled ? "active" : "disabled";
+        updates[`${collectionName}/${targetUid}/active`] = enabled;
+        updates[`${collectionName}/${targetUid}/disabled`] = !enabled;
+        updates[`${collectionName}/${targetUid}/accessUpdatedAt`] = now;
+        updates[`${collectionName}/${targetUid}/accessUpdatedBy`] = actor.uid;
+      }
+      const auditRef = database.ref("auditLogs").push();
+      updates[`auditLogs/${auditRef.key}`] = {
+        action: enabled ? "patient_account_enabled" : "patient_account_disabled",
+        actorEmail: actor.email,
+        actorId: actor.uid,
+        actorRole: actor.role,
+        createdAt: now,
+        source: "desktop",
+        status: "success",
+        summary: `${actor.email || "An administrator"} ${enabled ? "enabled" : "disabled"} a patient account.`,
+        targetId: targetUid,
+        targetType: "patient",
+        timestamp: now,
+      };
+      await database.ref().update(updates);
+    } catch (error) {
+      await auth.updateUser(targetUid, { disabled: previousAuthDisabled }).catch(() => undefined);
+      throw error;
+    }
+    if (!enabled) {
+      await auth.revokeRefreshTokens(targetUid).catch((error) => {
+        console.warn("Patient account was disabled, but existing refresh tokens could not be revoked.", error.message);
+      });
+    }
+
+    res.json({
+      ok: true,
+      account: {
+        accountStatus: enabled ? "active" : "disabled",
+        disabled: !enabled,
+        email: authUser.email || user?.email || profile?.email || "",
+        userId: targetUid,
       },
     });
   } catch (error) { sendError(res, error); }
@@ -4268,9 +4398,21 @@ app.patch("/api/staff/profile", async (req, res) => {
   } catch (error) { sendError(res, error); }
 });
 
-registerBookingRoutes(app, { getFirebaseApp: firebaseAdminApp });
+const bookingRoutes = registerBookingRoutes(app, { getFirebaseApp: firebaseAdminApp });
+// Importing route helpers must not start database work (for example in tests).
+if (require.main === module) {
+  const appointmentScheduleSweep = setInterval(() => {
+    bookingRoutes.processDueAppointments().catch(() => console.error("Appointment reminder sweep failed."));
+    bookingRoutes.dispatchPush().catch(() => console.error("Appointment push dispatch failed."));
+  }, 60000);
+  appointmentScheduleSweep.unref?.();
+  void bookingRoutes.processDueAppointments().catch(() => {});
+  void bookingRoutes.dispatchPush().catch(() => {});
+}
 registerQueueRoutes(app, { getFirebaseApp: firebaseAdminApp });
 registerSmpeRoutes(app);
+registerPatientRecordRoutes(app, { verifyPatientUid: uid => getAuth(firebaseAdminApp()).getUser(uid) });
+registerInventoryRoutes(app);
 registerSyncRoutes(app, { getFirebaseApp: firebaseAdminApp, assertAuthenticatorAccess: patientAuthenticatorAccess.assertAccess });
 
 app.post("/api/staff/appointments", async (req, res) => {
@@ -4429,6 +4571,8 @@ module.exports = {
     accountVerificationPurpose,
     cleanupChallenges,
     createChallenge,
+    createRegistrationToken,
+    consumeRegistrationToken,
     forgetChallenge,
     emailAttachmentsForHtml,
     emailReady,

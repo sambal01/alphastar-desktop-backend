@@ -5,6 +5,7 @@ const journey = require("./service-journey");
 const { syncAppointmentQueue } = require("./queue-routes");
 const { isHomeServiceAppointment } = require("./appointment-mode");
 const { transactionWithLiveSnapshot } = require("./realtime-transaction");
+const { queuePush, registerDevice, createPushDispatcher } = require("./appointment-push");
 
 const DEFAULT_SERVICES = [
   "Check-Up Bata-Matanda", "Complete Laboratory", "Digital X-Ray", "ECG", "2D Echo",
@@ -13,7 +14,9 @@ const DEFAULT_SERVICES = [
   "Employment Package", "Blood Chemistry Promo Package (8 Tests)", "Home Service Available",
 ];
 const STAFF_ROLES = new Set(["admin", "staff", "doctor", "nurse", "receptionist"]);
-const RELEASED_STATUSES = new Set(["cancelled", "canceled", "rejected", "declined", "deleted", "no_show", "no-show"]);
+const RELEASED_STATUSES = new Set(["cancelled", "canceled", "rejected", "declined", "deleted", "no_show", "no-show", "expired"]);
+const RESCHEDULE_AUTO_APPROVAL_MS = 15 * 60 * 1000;
+const APPOINTMENT_REMINDER_MS = 60 * 60 * 1000;
 
 class BookingError extends Error {
   constructor(message, status = 400, code = "BOOKING_INVALID") {
@@ -22,6 +25,8 @@ class BookingError extends Error {
     this.code = code;
   }
 }
+
+const homeBooking = require("./home-service-booking").create({ BookingError, serviceKey, normalizeService, requireDate, validateSlots, appointmentLocation, consumesCapacity });
 
 function clean(value, max = 160) {
   return String(value ?? "").normalize("NFKC").replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
@@ -110,7 +115,7 @@ function configSlots(root, serviceName, date) {
 function assertKnownService(root, serviceName, date) {
   const normalized = normalizeService(serviceName);
   const known = DEFAULT_SERVICES.some((name) => normalizeService(name) === normalized)
-    || Object.values(root.services || {}).some((service) => normalizeService(typeof service === "string" ? service : service.name || service.serviceName || service.title) === normalized)
+    || Object.values(root.services || {}).some((service) => normalizeService(typeof service === "string" ? service : service.service_name || service.name || service.serviceName || service.title) === normalized)
     || Object.values(root.appointments || {}).some((item) => normalizeService(item.serviceName || item.reason) === normalized)
     || Boolean(getSchedule(root, serviceName, date));
   if (!known) throw new BookingError("This clinic service is not available. Refresh the service list.");
@@ -146,7 +151,8 @@ function countSlot(bookings, slot) {
   return Object.values(bookings).filter((booking) => booking.startTime >= slot.startTime && booking.startTime < slot.endTime).length;
 }
 
-function listSlots(root, serviceName, date, now = Date.now()) {
+function listSlots(root, serviceName, date, now = Date.now(), homeService = false, excludedId = "") {
+  if (homeService) return homeBooking.listSlots(root, serviceName, date, now, excludedId);
   const bookings = matchingBookings(root, serviceName, date);
   const config = getSchedule(root, serviceName, date);
   return {
@@ -178,7 +184,8 @@ function writeSchedule(root, serviceName, date, slots, revision, actorId, now) {
   };
 }
 
-function refreshBookings(root, serviceName, date, actorId, now) {
+function refreshBookings(root, serviceName, date, actorId, now, homeService = false) {
+  if (homeService) return; // Home availability is derived from canonical appointments.
   const existing = getSchedule(root, serviceName, date);
   writeSchedule(root, serviceName, date, configSlots(root, serviceName, date), Number(existing?.revision || 0), actorId, now);
 }
@@ -187,6 +194,7 @@ function saveSchedule(root, input, actor, now) {
   const serviceName = requireService(input.serviceName);
   const date = requireDate(input.date);
   assertKnownService(root, serviceName, date);
+  if (input.mode === "home_service") return homeBooking.saveSchedule(root, { ...input, serviceName, date }, actor, now);
   const revision = Number(input.revision);
   if (!Number.isSafeInteger(revision) || revision < 0) throw new BookingError("Refresh the schedule before saving.");
   const current = getSchedule(root, serviceName, date);
@@ -216,7 +224,12 @@ function patientName(root, uid, fallback) {
   return clean(profile.fullName || profile.name || user.fullName || user.name || fallback || "Patient");
 }
 
-function assertBookable(root, serviceName, scheduledAt, now, excludedId = "") {
+function assertBookable(root, serviceName, scheduledAt, now, excludedId = "", homeService = false) {
+  if (homeService) {
+    const date = philippineParts(scheduledAt).date;
+    assertKnownService(root, serviceName, date);
+    return homeBooking.assertBookable(root, serviceName, scheduledAt, now, excludedId);
+  }
   if (typeof scheduledAt !== "string" || !/(?:Z|[+-]\d{2}:\d{2})$/.test(scheduledAt)) throw new BookingError("Appointment time must include its timezone.");
   const location = philippineParts(scheduledAt);
   requireDate(location.date);
@@ -242,8 +255,8 @@ function resolveAppointment(root, value) {
     return { appointment: direct, recordId: reference };
   }
 
-  // Older records may be addressed by their embedded id, appointment number,
-  // or legacy reference instead of their Realtime Database record key.
+  // Legacy clients may send an embedded ID or the patient-facing reference
+  // instead of the RTDB node key. Resolve it before mutating the schedule.
   const match = Object.entries(root.appointments || {}).find(([, candidate]) =>
     candidate &&
     typeof candidate === "object" &&
@@ -302,6 +315,21 @@ function notifyApprovedDestination(root, appointment, destination, now) {
       : `Your ${appointment.serviceName || appointment.reason || "clinic"} appointment is approved. The clinic will send your destination before your visit.`,
     isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp,
   };
+  if (isHomeServiceAppointment(appointment)) queuePush(root, root.notifications[id], Object.keys(root.appointments || {}).find(key => root.appointments[key] === appointment) || appointment.id, "approved", now);
+}
+
+function patientHasPendingAppointment(root, userId) {
+  const ownerId = clean(userId, 128);
+  if (!ownerId) return false;
+
+  return Object.values(root.appointments || {}).some((appointment) => {
+    if (!appointment || appointment.deletedAt || appointment.deleted === true) return false;
+    const owner = clean(appointment.userId || appointment.patientUserId || appointment.patientId, 128);
+    const status = String(appointment.status || appointment.appointmentStatus || "pending").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    // Retain the legacy helper name, but approvals do not free the patient to
+    // create another home visit. Only a terminal record releases this guard.
+    return owner === ownerId && !["completed", "complete", "done", "finished", "expired", "cancelled", "canceled", "rejected", "declined", "deleted", "removed", "no_show", "noshow"].includes(status);
+  });
 }
 
 function createBooking(root, input, actor, now) {
@@ -316,10 +344,23 @@ function createBooking(root, input, actor, now) {
     if (owner === uid && normalizeService(existing.serviceName) === normalizeService(serviceName) && Date.parse(existing.scheduledAt) === Date.parse(input.scheduledAt)) return existing;
     throw new BookingError("This appointment reference already exists. Refresh your appointments.", 409, "APPOINTMENT_CONFLICT");
   }
-  const { slot, date, time } = assertBookable(root, serviceName, input.scheduledAt, now);
+  const homeService = !actor.isStaff || isHomeServiceAppointment(input);
+  if (homeService && input.serviceIds !== undefined && (!Array.isArray(input.serviceIds) || input.serviceIds.length !== 1 || typeof input.serviceIds[0] !== "string" || !input.serviceIds[0].trim() || input.serviceId && input.serviceId !== input.serviceIds[0])) {
+    throw new BookingError("Choose exactly one service for a home-service appointment.", 400, "HOME_SERVICE_SINGLE_SERVICE");
+  }
+  if (homeService && patientHasPendingAppointment(root, uid)) {
+    throw new BookingError(
+      "You already have an active appointment. View your schedule and wait for completion, or cancel it before booking again.",
+      409,
+      "ACTIVE_APPOINTMENT_EXISTS",
+    );
+  }
+  const { slot, date, time } = assertBookable(root, serviceName, input.scheduledAt, now, "", homeService);
   const name = patientName(root, uid, input.patientName);
   const email = clean(root.users?.[uid]?.email || (actor.isStaff ? input.email : actor.email), 254);
-  const contact = clean(input.contactNumber || root.patientProfiles?.[uid]?.phone || "", 40);
+  const profile = root.patientProfiles?.[uid] || root.profiles?.[uid] || {};
+  const contact = clean(input.contactNumber || profile.contactNumber || profile.contactPhone || profile.mobileNumber || profile.phone || "", 40);
+  const homeAddress = clean(input.homeServiceAddress || profile.address || [profile.houseNumber, profile.street, profile.village, profile.barangay, profile.city, profile.province, profile.zipCode].filter(Boolean).join(", "), 1000);
   const timestamp = new Date(now).toISOString();
   const ref = `APT-${crypto.createHash("sha256").update(id).digest("hex").slice(0, 12).toUpperCase()}`;
   const appointment = {
@@ -331,9 +372,10 @@ function createBooking(root, input, actor, now) {
     timeSlotId: slot.id, serviceSlotKey: serviceKey(serviceName), slotReservation: true,
     appointmentNumber: ref, ref, status: "pending", appointmentStatus: "pending", paymentStatus: "unpaid",
     notes: clean(input.notes, 2000), doctor: clean(input.doctor || "Clinic team"),
+    homeServiceAddress: homeService ? homeAddress : "",
     bookingSource: actor.isStaff ? "desktop" : "mobile", booking_source: actor.isStaff ? "desktop" : "mobile",
     source: actor.isStaff ? "desktop" : "mobile", createdAt: timestamp, updatedAt: timestamp,
-    visitType: actor.isStaff ? "clinic" : "home_service",
+    visitType: homeService ? "home_service" : "clinic",
     createdBy: actor.uid, updatedBy: actor.uid,
   };
   if (input.serviceId) appointment.serviceId = clean(input.serviceId);
@@ -341,7 +383,7 @@ function createBooking(root, input, actor, now) {
   root.appointments ||= {};
   if (input.serviceIds !== undefined) journey.plan(root, appointment, input.serviceIds);
   root.appointments[id] = appointment;
-  refreshBookings(root, serviceName, date, actor.uid, now);
+  refreshBookings(root, serviceName, date, actor.uid, now, homeService);
   addAudit(root, `booking_created_${id}`, actor, "appointment_created", appointment, now);
   const notificationId = `booking_received_${id}`;
   root.notifications ||= {};
@@ -353,15 +395,218 @@ function createBooking(root, input, actor, now) {
   };
   if (!actor.isStaff) {
     const staffNoticeId = "appointment-" + id;
-    root.notifications[staffNoticeId] = {
-      id: staffNoticeId, userId: "desktop-staff", type: "appointment", source: "mobile",
-      referenceType: "appointment", referenceId: id,
-      title: "New Mobile Appointment",
-      message: name + " booked " + serviceName + " for " + date + " at " + slot.startTime + ".",
-      isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp,
-    };
+    root.notifications[staffNoticeId] = { id: staffNoticeId, userId: "desktop-staff", type: "appointment", source: "mobile", referenceType: "appointment", referenceId: id, title: "New Mobile Appointment", message: name + " booked " + serviceName + " for " + date + " at " + slot.startTime + ".", isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp };
   }
   return appointment;
+}
+
+function requestBookingReschedule(root, id, input, actor, now) {
+  const { appointment, recordId } = resolveAppointment(root, id);
+  if (!appointment) throw new BookingError("Appointment not found.", 404, "APPOINTMENT_NOT_FOUND");
+
+  const owner = appointment.userId || appointment.patientUserId || appointment.patientId;
+  if (owner !== actor.uid) throw new BookingError("You cannot change this appointment.", 403, "BOOKING_FORBIDDEN");
+
+  const status = String(appointment.status || appointment.appointmentStatus || "pending").toLowerCase();
+  if (!["pending", "reschedule_requested"].includes(status)) {
+    const approved = ["confirmed", "scheduled", "approved"].includes(status);
+    throw new BookingError(
+      approved
+        ? "This appointment has already been approved. You can cancel it, but only clinic staff can reschedule it."
+        : "Please contact clinic staff to change this appointment.",
+      409,
+      "APPOINTMENT_LOCKED",
+    );
+  }
+
+  const serviceName = requireService(appointment.serviceName || appointment.reason);
+  const next = assertBookable(root, serviceName, input?.requestedScheduledAt, now, recordId, isHomeServiceAppointment(appointment));
+  appointment.requestedScheduledAt = new Date(slotStart(next.date, next.time)).toISOString();
+  appointment.rescheduleRequestedAt = new Date(now).toISOString();
+  appointment.rescheduleAutoApproveAt = new Date(now + RESCHEDULE_AUTO_APPROVAL_MS).toISOString();
+  appointment.status = "reschedule_requested";
+  appointment.appointmentStatus = "reschedule_requested";
+  appointment.updatedAt = new Date(now).toISOString();
+  appointment.updatedBy = actor.uid;
+  addAudit(root, `booking_reschedule_requested_${recordId}_${now}`, actor, "appointment_reschedule_requested", appointment, now);
+  root.notifications ||= {};
+  root.notifications[`reschedule_request_${appointment.id}`] = {
+    id: `reschedule_request_${appointment.id}`,
+    userId: "desktop-staff",
+    type: "appointment",
+    source: "mobile",
+    referenceType: "appointment",
+    referenceId: appointment.id,
+    title: "Reschedule approval requested",
+    message: `${appointment.patientName || "A patient"} requested ${serviceName} on ${next.date} at ${next.slot.startTime}. Approve or update it within 15 minutes; it will be automatically approved if no action is taken.`,
+    isRead: false,
+    read: false,
+    createdAt: new Date(now).toISOString(),
+    updatedAt: new Date(now).toISOString(),
+  };
+  return appointment;
+}
+
+function autoApproveExpiredRescheduleRequests(root, now) {
+  const actor = { uid: "system_reschedule_approval", email: "", isStaff: true, role: "system" };
+  const approved = [];
+  for (const [recordId, appointment] of Object.entries(root.appointments || {})) {
+    if (String(appointment?.status || appointment?.appointmentStatus || "").toLowerCase() !== "reschedule_requested") continue;
+    const requestedAt = Date.parse(appointment.rescheduleRequestedAt || appointment.updatedAt || "");
+    if (!Number.isFinite(requestedAt) || now - requestedAt < RESCHEDULE_AUTO_APPROVAL_MS) continue;
+    const requestedScheduledAt = appointment.requestedScheduledAt;
+    if (!requestedScheduledAt || !Number.isFinite(Date.parse(requestedScheduledAt))) continue;
+
+    try {
+      const serviceName = requireService(appointment.serviceName || appointment.reason);
+      const oldLocation = appointmentLocation(appointment);
+      const next = assertBookable(root, serviceName, requestedScheduledAt, now, recordId, isHomeServiceAppointment(appointment));
+      Object.assign(appointment, {
+        scheduledAt: new Date(slotStart(next.date, next.time)).toISOString(),
+        appointmentDate: next.date,
+        startTime: next.slot.startTime,
+        endTime: next.slot.endTime,
+        time: next.slot.startTime,
+        timeSlotId: next.slot.id,
+        status: "scheduled",
+        appointmentStatus: "scheduled",
+        decisionReason: "Reschedule automatically approved after 15 minutes without a staff response.",
+        rescheduleAutoApprovedAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+        updatedBy: actor.uid,
+      });
+      delete appointment.requestedScheduledAt;
+      delete appointment.rescheduleAutoApproveAt;
+      if (oldLocation.date) refreshBookings(root, serviceName, oldLocation.date, actor.uid, now, isHomeServiceAppointment(appointment));
+      if (next.date !== oldLocation.date) refreshBookings(root, serviceName, next.date, actor.uid, now, isHomeServiceAppointment(appointment));
+      addAudit(root, `booking_reschedule_auto_approved_${recordId}_${now}`, actor, "appointment_reschedule_auto_approved", appointment, now);
+      root.notifications ||= {};
+      root.notifications[`reschedule_auto_approved_${appointment.id}`] = {
+        id: `reschedule_auto_approved_${appointment.id}`,
+        userId: appointment.userId || appointment.patientUserId || appointment.patientId,
+        type: "appointment",
+        referenceType: "appointment",
+        referenceId: appointment.id,
+        title: "Reschedule approved",
+        message: isHomeServiceAppointment(appointment)
+          ? `Your ${serviceName} home-service reschedule for ${next.date} at ${next.slot.startTime} was automatically approved after 15 minutes. Clinic staff will coordinate the home visit with you.`
+          : `Your ${serviceName} reschedule request for ${next.date} at ${next.slot.startTime} was automatically approved after 15 minutes. The clinic will provide your destination before your visit.`,
+        isRead: false,
+        read: false,
+        createdAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      };
+      syncAppointmentQueue(root, appointment, actor, now);
+      approved.push(appointment.id);
+    } catch (error) {
+      // The requested slot may have filled before the deadline. Keep the request
+      // open so Staff/Admin can choose another available time instead.
+      if (!(error instanceof BookingError)) throw error;
+    }
+  }
+  return approved;
+}
+
+function appointmentVisitTiming(appointment) {
+  const status = String(appointment.status || appointment.appointmentStatus || "").toLowerCase();
+  const requestedAt = Date.parse(appointment.requestedScheduledAt || "");
+  const scheduledAt = status === "reschedule_requested" && Number.isFinite(requestedAt)
+    ? requestedAt
+    : Date.parse(appointment.scheduledAt || "");
+  if (Number.isFinite(scheduledAt)) {
+    return { start: scheduledAt, date: philippineParts(scheduledAt).date };
+  }
+  const location = appointmentLocation(appointment);
+  const date = String(location.date || "");
+  const start = Date.parse(`${date}T${location.time || "00:00"}:00+08:00`);
+  return { start, date };
+}
+
+function hasAttendedVisit(root, appointment, recordId, date) {
+  const checkedInAt = Date.parse(appointment.checkedInAt || "");
+  if (Number.isFinite(checkedInAt) && philippineParts(checkedInAt).date === date) return true;
+  if (appointment.completedAt) return true;
+  const references = new Set([recordId, appointment.id, appointment.appointmentId, appointment.appointmentNumber, appointment.ref].filter(Boolean).map(String));
+  return Object.values(root.queueEntries || {}).some((entry) => {
+    if (!entry || entry.deletedAt) return false;
+    if (![entry.appointmentId, entry.appointmentRecordId, entry.appointmentNumber].some((value) => references.has(String(value || "")))) return false;
+    const entryTime = Date.parse(entry.checkedInAt || entry.createdAt || "");
+    const entryDate = entry.queueDate || (Number.isFinite(entryTime) ? philippineParts(entryTime).date : "");
+    return entryDate === date && ["in_service", "serving", "done", "completed"].includes(String(entry.status || "").toLowerCase());
+  });
+}
+
+function dueAppointmentEvent(root, appointment, recordId, now) {
+  if (!appointment || typeof appointment !== "object" || appointment.deletedAt) return null;
+  const status = String(appointment.status || appointment.appointmentStatus || "pending").toLowerCase();
+  if (!["pending", "reschedule_requested", "approved", "confirmed", "scheduled", "on_the_way"].includes(status)) return null;
+  const { start, date } = appointmentVisitTiming(appointment);
+  const dayStart = Date.parse(`${date}T00:00:00+08:00`);
+  if (!Number.isFinite(dayStart) || new Date(dayStart + 8 * 60 * 60 * 1000).toISOString().slice(0, 10) !== date) return null;
+  if (hasAttendedVisit(root, appointment, recordId, date)) return null;
+  if (now >= dayStart + 24 * 60 * 60 * 1000) return status === "on_the_way" ? null : { type: "expired", date, start };
+  if (!["approved", "confirmed", "scheduled", "on_the_way"].includes(status) || !Number.isFinite(start)) return null;
+  if (now < start - APPOINTMENT_REMINDER_MS || now >= start) return null;
+  const hash = crypto.createHash("sha256").update(`${recordId}:${start}`).digest("hex").slice(0, 24);
+  const notificationId = `appointment_reminder_${hash}`;
+  return root.appointmentReminderReceipts?.[notificationId] || root.notifications?.[notificationId] ? null : { type: "reminder", date, start, notificationId };
+}
+
+function processDueAppointmentEvents(root, now) {
+  const actor = { uid: "system_appointment_schedule", email: "", isStaff: true, role: "system" };
+  const timestamp = new Date(now).toISOString();
+  const result = { reminded: [], expired: [] };
+  for (const [recordId, appointment] of Object.entries(root.appointments || {})) {
+    const event = dueAppointmentEvent(root, appointment, recordId, now);
+    if (!event) continue;
+    const referenceId = appointment.id || recordId;
+    const userId = appointment.userId || appointment.patientUserId || appointment.patientId;
+    const serviceName = clean(appointment.serviceName || appointment.reason || "clinic", 160);
+    if (event.type === "reminder") {
+      root.appointmentReminderReceipts ||= {};
+      root.appointmentReminderReceipts[event.notificationId] = { recordId, scheduledAt: appointment.scheduledAt, createdAt: timestamp };
+      const time = new Date(event.start).toLocaleTimeString("en-PH", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit" });
+      const destination = appointment.destinationFloor && appointment.destinationRoom
+        ? ` Destination: ${appointment.destinationFloor} – ${appointment.destinationRoom}.`
+        : "";
+      root.notifications ||= {};
+      root.notifications[event.notificationId] = {
+        id: event.notificationId, userId, type: "appointment", referenceType: "appointment", referenceId,
+        title: "Appointment starts soon",
+        message: isHomeServiceAppointment(appointment)
+          ? `Your Alphastar home-service appointment is today at ${time}. Please prepare and keep your phone available.`
+          : `Your ${serviceName} appointment starts today at ${time}. Please arrive on time and check in at the clinic.${destination}`,
+        isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp,
+      };
+      if (isHomeServiceAppointment(appointment)) queuePush(root, root.notifications[event.notificationId], recordId, "reminder", now);
+      result.reminded.push(referenceId);
+      continue;
+    }
+    const pending = ["pending", "reschedule_requested"].includes(String(appointment.status || appointment.appointmentStatus || "").toLowerCase());
+    appointment.id ||= recordId;
+    appointment.status = "expired";
+    appointment.appointmentStatus = "expired";
+    appointment.expiredAt = timestamp;
+    appointment.expiryReason = pending ? "The requested date passed before confirmation." : "The scheduled day ended without patient check-in.";
+    appointment.updatedAt = timestamp;
+    appointment.updatedBy = actor.uid;
+    root.notifications ||= {};
+    const notificationId = `appointment_expired_${crypto.createHash("sha256").update(recordId).digest("hex").slice(0, 24)}`;
+    root.notifications[notificationId] = {
+      id: notificationId, userId, type: "appointment", referenceType: "appointment", referenceId,
+      title: "Appointment expired",
+      message: pending
+        ? `Your ${serviceName} appointment request for ${event.date} expired because the scheduled day ended before confirmation. Please book a new date if you still need this service.`
+        : `Your ${serviceName} appointment for ${event.date} expired because the scheduled day ended without check-in. Please book a new appointment if you still need this service.`,
+      isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp,
+    };
+    const oldLocation = appointmentLocation(appointment);
+    if (oldLocation.date && serviceName) refreshBookings(root, serviceName, oldLocation.date, actor.uid, now);
+    addAudit(root, `booking_expired_${recordId}`, actor, "appointment_expired", appointment, now);
+    syncAppointmentQueue(root, appointment, actor, now);
+    result.expired.push(referenceId);
+  }
+  return result;
 }
 
 function updateBooking(root, id, input, actor, now, action) {
@@ -369,27 +614,40 @@ function updateBooking(root, id, input, actor, now, action) {
   if (!appointment) throw new BookingError("Appointment not found.", 404, "APPOINTMENT_NOT_FOUND");
   const owner = appointment.userId || appointment.patientUserId || appointment.patientId;
   if (!actor.isStaff && owner !== actor.uid) throw new BookingError("You cannot change this appointment.", 403, "BOOKING_FORBIDDEN");
+  if (input.expectedUpdatedAt && appointment.updatedAt !== input.expectedUpdatedAt) throw new BookingError("This appointment changed. Refresh before updating it.", 409, "APPOINTMENT_CONFLICT");
+  if (!actor.isStaff && String(appointment.status || appointment.appointmentStatus || "").toLowerCase() === "expired") {
+    throw new BookingError("This appointment has expired. Please book a new date.", 409, "APPOINTMENT_EXPIRED");
+  }
   const oldLocation = appointmentLocation(appointment);
+  const previousStatus = String(appointment.status || appointment.appointmentStatus || "").toLowerCase();
   const serviceName = requireService(appointment.serviceName || appointment.reason);
   const previousActive = consumesCapacity(appointment);
   const wasApproved = ["approved", "confirmed", "scheduled"].includes(String(appointment.status || appointment.appointmentStatus || "").toLowerCase());
-  const wasRescheduleRequested = String(appointment.status || appointment.appointmentStatus || "").toLowerCase() === "reschedule_requested";
   if (action === "schedule") {
     if (!actor.isStaff) throw new BookingError("Only clinic staff can reschedule appointments.", 403, "BOOKING_FORBIDDEN");
-    const next = assertBookable(root, serviceName, input.scheduledAt, now, recordId);
+    const next = assertBookable(root, serviceName, input.scheduledAt, now, recordId, isHomeServiceAppointment(appointment));
     Object.assign(appointment, {
       scheduledAt: new Date(slotStart(next.date, next.time)).toISOString(), appointmentDate: next.date,
       startTime: next.slot.startTime, endTime: next.slot.endTime, time: next.slot.startTime,
       timeSlotId: next.slot.id, status: "scheduled", appointmentStatus: "scheduled",
     });
-    if (wasRescheduleRequested) {
-      delete appointment.requestedScheduledAt;
-    }
+    delete appointment.requestedScheduledAt;
+    delete appointment.rescheduleAutoApproveAt;
+    delete appointment.onTheWayAt;
+    delete appointment.staffUpdate;
+    delete appointment.staffUpdatedAt;
   } else {
     const status = action === "cancel" ? "cancelled" : String(input.status || "").toLowerCase();
-    if (!["pending", "confirmed", "scheduled", "approved", "checked_in", "in_progress", "in_service", "in_consultation", "serving", "completed", ...RELEASED_STATUSES].includes(status)) throw new BookingError("Choose a valid appointment status.");
-    if (!actor.isStaff && ["completed", "checked_in", "in_progress", "in_service", "in_consultation", "serving"].includes(appointment.status)) throw new BookingError("Please contact clinic staff to change this appointment.", 409, "APPOINTMENT_LOCKED");
-    if (!previousActive && !RELEASED_STATUSES.has(status)) assertBookable(root, serviceName, appointment.scheduledAt, now, recordId);
+    if (!["pending", "confirmed", "scheduled", "approved", "on_the_way", "checked_in", "in_progress", "in_service", "in_consultation", "serving", "completed", ...RELEASED_STATUSES].includes(status)) throw new BookingError("Choose a valid appointment status.");
+    if (!actor.isStaff && action !== "cancel") throw new BookingError("Only clinic staff can update appointment status.", 403, "BOOKING_FORBIDDEN");
+    if (!actor.isStaff && ["on_the_way", "completed", "checked_in", "in_progress", "in_service", "in_consultation", "serving"].includes(appointment.status)) throw new BookingError("Please contact clinic staff to change this appointment.", 409, "APPOINTMENT_LOCKED");
+    if (status === "on_the_way") {
+      if (!actor.isStaff || !["admin", "staff"].includes(actor.role) || !isHomeServiceAppointment(appointment)) throw new BookingError("Only authorized home-service staff can record departure.", 403, "BOOKING_FORBIDDEN");
+      if (previousStatus === "on_the_way") return appointment;
+      if (!["approved", "confirmed", "scheduled"].includes(previousStatus) || oldLocation.date !== philippineParts(now).date) throw new BookingError("Confirm this appointment first and record departure on its scheduled date.", 409, "APPOINTMENT_LOCKED");
+      appointment.onTheWayAt = new Date(now).toISOString();
+    }
+    if (!previousActive && !RELEASED_STATUSES.has(status)) assertBookable(root, serviceName, appointment.scheduledAt, now, recordId, isHomeServiceAppointment(appointment));
     appointment.status = status;
     appointment.appointmentStatus = status;
   }
@@ -404,33 +662,97 @@ function updateBooking(root, id, input, actor, now, action) {
   }
   appointment.updatedAt = new Date(now).toISOString();
   appointment.updatedBy = actor.uid;
-  if (oldLocation.date) refreshBookings(root, serviceName, oldLocation.date, actor.uid, now);
+  if (appointment.status === "on_the_way" && previousStatus !== "on_the_way") {
+    const noticeId = `home_departure_${crypto.createHash("sha256").update(`${recordId}:${appointment.scheduledAt}`).digest("hex").slice(0, 24)}`;
+    root.notifications ||= {};
+    root.notifications[noticeId] ||= { id: noticeId, userId: owner, type: "appointment", referenceType: "appointment", referenceId: recordId,
+      title: "Staff on the way", message: "Our staff is on the way to your address. Please keep your phone available.", isRead: false, read: false, createdAt: appointment.updatedAt, updatedAt: appointment.updatedAt };
+    queuePush(root, root.notifications[noticeId], recordId, "on_the_way", now);
+  }
+  if (actor.isStaff && isHomeServiceAppointment(appointment) && ["cancelled", "canceled"].includes(appointment.status) && !["cancelled", "canceled"].includes(previousStatus)) {
+    appointment.cancelledAt = appointment.updatedAt;
+    appointment.cancellationReason = appointment.decisionReason;
+    if (owner) {
+      const noticeId = `appointment_cancelled_${crypto.createHash("sha256").update(recordId).digest("hex").slice(0, 24)}`;
+      root.notifications ||= {};
+      root.notifications[noticeId] = {
+        id: noticeId, userId: owner, type: "appointment_cancelled", referenceType: "appointment", referenceId: recordId,
+        title: "Home-service appointment cancelled",
+        message: `Clinic staff cancelled your ${serviceName} home-service appointment.${appointment.decisionReason ? ` Reason: ${appointment.decisionReason}.` : ""} View the appointment in Home Service History. You may book another available schedule.`,
+        isRead: false, read: false, createdAt: appointment.updatedAt, updatedAt: appointment.updatedAt,
+      };
+      queuePush(root, root.notifications[noticeId], recordId, "cancelled", now);
+    }
+  }
+  if (!actor.isStaff && action === "cancel" && isHomeServiceAppointment(appointment) && !["cancelled", "canceled"].includes(previousStatus)) {
+    appointment.cancelledAt = appointment.updatedAt;
+    appointment.cancellationReason = appointment.decisionReason;
+    const noticeId = `patient_home_cancelled_${crypto.createHash("sha256").update(recordId).digest("hex").slice(0, 24)}`;
+    const reference = clean(appointment.appointmentNumber || appointment.ref || recordId);
+    const scheduledAt = Date.parse(appointment.scheduledAt || `${oldLocation.date}T${oldLocation.time}:00+08:00`);
+    const schedule = Number.isFinite(scheduledAt)
+      ? new Intl.DateTimeFormat("en-PH", { timeZone: "Asia/Manila", dateStyle: "medium", timeStyle: "short" }).format(scheduledAt)
+      : clean([oldLocation.date, oldLocation.time].filter(Boolean).join(" "));
+    root.notifications ||= {};
+    root.notifications[noticeId] = {
+      id: noticeId, userId: "desktop-staff", type: "appointment_cancelled", source: "mobile",
+      referenceType: "appointment", referenceId: recordId,
+      title: "Patient cancelled home-service appointment",
+      message: `${clean(appointment.patientName) || "A patient"} cancelled ${reference} for ${serviceName}${schedule ? ` scheduled for ${schedule}` : ""}.${appointment.cancellationReason ? ` Reason: ${appointment.cancellationReason}.` : ""} View Home Service History for details.`,
+      isRead: false, read: false, createdAt: appointment.updatedAt, updatedAt: appointment.updatedAt,
+    };
+  }
+  if (oldLocation.date) refreshBookings(root, serviceName, oldLocation.date, actor.uid, now, isHomeServiceAppointment(appointment));
   const newLocation = appointmentLocation(appointment);
-  if (newLocation.date && newLocation.date !== oldLocation.date) refreshBookings(root, serviceName, newLocation.date, actor.uid, now);
+  if (newLocation.date && newLocation.date !== oldLocation.date) refreshBookings(root, serviceName, newLocation.date, actor.uid, now, isHomeServiceAppointment(appointment));
   addAudit(root, `booking_${action}_${recordId}_${now}`, actor, `appointment_${action === "cancel" ? "cancelled" : action === "schedule" ? "rescheduled" : "decision"}`, appointment, now);
   syncAppointmentQueue(root, appointment, actor, now);
   return appointment;
+}
+
+function staffAppointmentUpdate(root, id, input, actor, now) {
+  const { appointment, recordId } = resolveAppointment(root, id);
+  if (!actor.isStaff || !["admin", "staff"].includes(actor.role)) throw new BookingError("Only authorized staff can send updates.", 403, "BOOKING_FORBIDDEN");
+  if (!appointment || !isHomeServiceAppointment(appointment)) throw new BookingError("Home-service appointment not found.", 404, "APPOINTMENT_NOT_FOUND");
+  const requestId = validateId(input.requestId), message = clean(input.message, 501);
+  if (!message || message.length > 500) throw new BookingError("Enter an appointment update of 1–500 characters.");
+  const noticeId = `home_update_${crypto.createHash("sha256").update(`${recordId}:${requestId}`).digest("hex").slice(0, 24)}`;
+  const previous = root.notifications?.[noticeId];
+  if (previous) {
+    if (previous.message !== message) throw new BookingError("This update reference already contains another message.", 409, "APPOINTMENT_CONFLICT");
+    return { appointment, notification: previous };
+  }
+  if (appointment.deletedAt || appointment.deleted || !["approved", "confirmed", "scheduled", "on_the_way"].includes(appointment.status || appointment.appointmentStatus)) throw new BookingError("Only active confirmed home visits can receive an update.", 409, "APPOINTMENT_LOCKED");
+  if (input.expectedUpdatedAt && appointment.updatedAt !== input.expectedUpdatedAt) throw new BookingError("This appointment changed. Refresh before sending an update.", 409, "APPOINTMENT_CONFLICT");
+  const timestamp = new Date(now).toISOString();
+  const notification = { id: noticeId, userId: appointment.userId || appointment.patientUserId || appointment.patientId,
+    type: "appointment", referenceType: "appointment", referenceId: recordId, title: "Home-service appointment update", message,
+    isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp };
+  root.notifications ||= {}; root.notifications[noticeId] = notification;
+  appointment.staffUpdate = message; appointment.staffUpdatedAt = timestamp; appointment.updatedAt = timestamp; appointment.updatedBy = actor.uid;
+  queuePush(root, notification, recordId, "update", now);
+  addAudit(root, noticeId, actor, "home_service_update", appointment, now);
+  return { appointment, notification };
 }
 
 function registerBookingRoutes(app, options) {
   const clock = options.now || Date.now;
   const getDatabase = options.getDatabase || require("firebase-admin/database").getDatabase;
   const getAuth = options.getAuth || require("firebase-admin/auth").getAuth;
+  let pushDispatcher;
+  async function dispatchPush() {
+    const firebaseApp = options.getFirebaseApp(); if (!firebaseApp) return;
+    pushDispatcher ||= createPushDispatcher({ database: getDatabase(firebaseApp), now: clock, ...(options.pushOptions || {}) });
+    return pushDispatcher.dispatch();
+  }
   async function legacyAppointments() {
     if (options.loadLegacyAppointments) {
       try {
         return await options.loadLegacyAppointments();
-      } catch (error) {
-        // Firestore is only a legacy appointment source. A disabled, missing,
-        // or permission-restricted Firestore database must not stop RTDB
-        // availability from loading or saving.
-        console.warn("Legacy Firestore appointments are unavailable; using Realtime Database schedules.", error.message);
+      } catch {
         return {};
       }
     }
-    // The clinic's canonical appointment store is Realtime Database. Do not
-    // query Firestore as a fallback: this project intentionally does not
-    // require the Firestore API for booking, staff decisions, or queue flow.
     return {};
   }
 
@@ -452,9 +774,9 @@ function registerBookingRoutes(app, options) {
     const [userSnap, staffSnap] = await Promise.all([database.ref(`users/${decoded.uid}`).get(), database.ref(`staff/${decoded.uid}`).get()]);
     const user = userSnap.val() || {};
     const staff = staffSnap.val() || {};
-    if (!Boolean(userSnap.val()) || user.disabled || user.deletedAt || staff.disabled || staff.deletedAt || user.active === false || staff.active === false || [user.status, user.accountStatus, staff.status, staff.accountStatus].some((value) => ["disabled", "blocked", "inactive", "suspended"].includes(String(value || "").toLowerCase()))) throw new BookingError("This account is inactive.", 403, "BOOKING_FORBIDDEN");
-    const roles = [user.role || user.accountRole || staff.accountRole || staff.role].map((value) => String(value || "").trim().toLowerCase());
-    const isStaff = Boolean(userSnap.val()) && roles.some((role) => STAFF_ROLES.has(role));
+    if (user.disabled || user.deletedAt || ["disabled", "blocked", "inactive"].includes(String(user.status || "").toLowerCase())) throw new BookingError("This account is inactive.", 403, "BOOKING_FORBIDDEN");
+    const roles = [decoded.role, user.role, staff.accountRole, staff.role].map((role) => String(role || "").toLowerCase());
+    const isStaff = decoded.admin === true || roles.some((role) => STAFF_ROLES.has(role));
     if (requireStaff && !isStaff) throw new BookingError("Only clinic staff can change the schedule.", 403, "BOOKING_FORBIDDEN");
     return { database, actor: { uid: decoded.uid, email: decoded.email || user.email || "", isStaff, role: isStaff ? roles.find((role) => STAFF_ROLES.has(role)) || "admin" : "patient" } };
   }
@@ -487,17 +809,34 @@ function registerBookingRoutes(app, options) {
     });
     if (rejection) throw rejection;
     if (!transaction.committed || result === undefined) throw new BookingError("The schedule changed. Refresh and try again.", 409, "SCHEDULE_CONFLICT");
+    if (options.dispatchPush !== false) void dispatchPush().catch(() => {});
     return result;
   }
 
+  function excludedBooking(root, req, actor) {
+    if (!req.query.exclude) return "";
+    const { appointment, recordId } = resolveAppointment(root, req.query.exclude);
+    if (!appointment || !actor.isStaff && (appointment.userId || appointment.patientUserId || appointment.patientId) !== actor.uid) throw new BookingError("You cannot change this appointment.", 403, "BOOKING_FORBIDDEN");
+    return recordId;
+  }
+
+  app.get("/api/booking/calendar", route(async (req, res) => {
+    const { database, actor } = await context(req);
+    const serviceName = requireService(req.query.service), month = String(req.query.month || "");
+    const [snapshot, legacy] = await Promise.all([database.ref().get(), legacyAppointments()]);
+    const root = mergeLegacy(snapshot.val() || {}, legacy);
+    assertKnownService(root, serviceName, month + "-01");
+    res.json(homeBooking.calendar(root, serviceName, month, clock(), excludedBooking(root, req, actor)));
+  }));
+
   app.get("/api/booking/slots", route(async (req, res) => {
-    const { database } = await context(req);
+    const { database, actor } = await context(req);
     const serviceName = requireService(req.query.service);
     const date = requireDate(req.query.date);
     const [snapshot, legacy] = await Promise.all([database.ref().get(), legacyAppointments()]);
     const root = mergeLegacy(snapshot.val() || {}, legacy);
     assertKnownService(root, serviceName, date);
-    res.json(listSlots(root, serviceName, date, clock()));
+    res.json(listSlots(root, serviceName, date, clock(), req.query.mode === "home_service", excludedBooking(root, req, actor)));
   }));
 
   app.post("/api/booking/schedule", route(async (req, res) => {
@@ -519,6 +858,12 @@ function registerBookingRoutes(app, options) {
     res.json({ ok: true, appointment });
   }));
 
+  app.post("/api/booking/appointments/:appointmentId/reschedule", route(async (req, res) => {
+    const { database, actor } = await context(req);
+    const appointment = await mutate(database, (root, now) => requestBookingReschedule(root, req.params.appointmentId, req.body, actor, now));
+    res.json({ ok: true, appointment });
+  }));
+
   // Register before existing legacy staff handlers to enforce the same capacity rules.
   app.post("/api/staff/appointments", route(async (req, res) => {
     const { database, actor } = await context(req, true);
@@ -534,9 +879,57 @@ function registerBookingRoutes(app, options) {
       res.json({ ok: true, appointment });
     }));
   }
+
+  app.post("/api/staff/appointments/:appointmentId/update", route(async (req, res) => {
+    const { database, actor } = await context(req, true);
+    const result = await mutate(database, (root, now) => staffAppointmentUpdate(root, req.params.appointmentId, req.body, actor, now));
+    res.json({ ok: true, ...result });
+  }));
+  app.post("/api/patient/push-device", route(async (req, res) => {
+    const { database, actor } = await context(req);
+    if (actor.isStaff) throw new BookingError("Sign in with your patient account.", 403, "BOOKING_FORBIDDEN");
+    const result = await mutate(database, (root, now) => registerDevice(root, actor.uid, req.body, now));
+    res.json(result);
+  }));
+
+  return {
+    dispatchPush,
+    async autoApproveDueReschedules() {
+      const firebaseApp = options.getFirebaseApp();
+      if (!firebaseApp) return [];
+      const database = getDatabase(firebaseApp);
+      const snapshot = await database.ref("appointments").get();
+      const hasDueRequest = Object.values(snapshot.val() || {}).some((appointment) => {
+        const status = String(appointment?.status || appointment?.appointmentStatus || "").toLowerCase();
+        const requestedAt = Date.parse(appointment?.rescheduleRequestedAt || appointment?.updatedAt || "");
+        return status === "reschedule_requested" && Number.isFinite(requestedAt) && clock() - requestedAt >= RESCHEDULE_AUTO_APPROVAL_MS;
+      });
+      if (!hasDueRequest) return [];
+      return mutate(database, (root, now) => autoApproveExpiredRescheduleRequests(root, now));
+    },
+    async processDueAppointments() {
+      const firebaseApp = options.getFirebaseApp();
+      if (!firebaseApp) return { reminded: [], expired: [] };
+      const database = getDatabase(firebaseApp);
+      const [appointmentsSnapshot, notificationsSnapshot, queueSnapshot] = await Promise.all([
+        database.ref("appointments").get(),
+        database.ref("notifications").get(),
+        database.ref("queueEntries").get(),
+      ]);
+      const root = {
+        appointments: appointmentsSnapshot.val() || {},
+        notifications: notificationsSnapshot.val() || {},
+        queueEntries: queueSnapshot.val() || {},
+      };
+      const now = clock();
+      const hasDueEvent = Object.entries(root.appointments).some(([recordId, appointment]) => dueAppointmentEvent(root, appointment, recordId, now));
+      if (!hasDueEvent) return { reminded: [], expired: [] };
+      return mutate(database, (current, transactionNow) => processDueAppointmentEvents(current, transactionNow));
+    },
+  };
 }
 
 module.exports = {
   registerBookingRoutes,
-  __test: { BookingError, serviceKey, defaultSlots, validateSlots, listSlots, saveSchedule, createBooking, updateBooking, appointmentLocation, matchingBookings, destinationForAppointment },
+  __test: { BookingError, serviceKey, defaultSlots, validateSlots, listSlots, saveSchedule, createBooking, patientHasPendingAppointment, requestBookingReschedule, autoApproveExpiredRescheduleRequests, dueAppointmentEvent, processDueAppointmentEvents, updateBooking, staffAppointmentUpdate, appointmentLocation, matchingBookings, destinationForAppointment },
 };

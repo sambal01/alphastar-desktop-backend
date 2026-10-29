@@ -7,6 +7,16 @@ const { AccountError, createAccountService, requireAdministrator } = require("..
 const NOW = "2026-09-10T03:00:00.000Z";
 const administrator = { uid: "admin_auth", role: "admin", email: "admin@example.invalid" };
 
+test("only the trusted email-verification option marks a new account verified", async () => {
+  const unverified = fixture();
+  const original = await unverified.service.create(input({ emailVerified: true }), administrator);
+  assert.equal(original.user.emailVerified, false); assert.equal(unverified.authAccounts()[original.user.userId].emailVerified, false);
+  const verified = fixture();
+  const created = await verified.service.create(input(), administrator, { emailVerified: true });
+  assert.equal(created.user.emailVerified, true); assert.equal(created.staff.emailVerified, true);
+  assert.equal(verified.authAccounts()[created.user.userId].emailVerified, true);
+});
+
 test("administrators set passwords in Auth without copying them to records or logs", async () => {
   const f = fixture();
   const creationPassword = "Created-private-password-123";
@@ -28,12 +38,25 @@ test("password changes reject Staff, own-profile requests, and invalid passwords
     ["Valid-password123", { uid: "staff", role: "staff" }, {}],
     ["Valid-password123", administrator, { ownProfile: true }],
     ["short", administrator, {}],
+    ["alllowercase123!", administrator, {}],
+    ["ALLUPPERCASE123!", administrator, {}],
+    ["NoNumberHere!", administrator, {}],
+    ["NoSpecialCharacter123", administrator, {}],
     [123456789, administrator, {}],
   ]) {
     await assert.rejects(f.service.update("target", { password }, actor, options));
   }
   assert.equal(f.authCalls.length, 0);
   assert.equal(f.commits.length, 0);
+});
+
+test("account creation enforces every displayed password requirement before Auth writes", async () => {
+  for (const password of ["alllowercase123!", "ALLUPPERCASE123!", "NoNumberHere!", "NoSpecialCharacter123"]) {
+    const f = fixture();
+    await assert.rejects(f.service.create(input({ password }), administrator), /uppercase and lowercase letters/);
+    assert.equal(f.authCalls.length, 0);
+    assert.equal(f.commits.length, 0);
+  }
 });
 
 function fixture(initial = {}, options = {}) {

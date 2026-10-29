@@ -14,6 +14,18 @@ function clean(value, length = 160) {
   return String(value ?? "").normalize("NFKC").replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, length);
 }
 
+function validAccountPassword(value) {
+  return typeof value === "string"
+    && value.length >= 8
+    && value.length <= 128
+    && /\d/.test(value)
+    && /[a-z]/.test(value)
+    && /[A-Z]/.test(value)
+    && /[^A-Za-z0-9]/.test(value);
+}
+
+const ACCOUNT_PASSWORD_MESSAGE = "Use 8–128 characters with uppercase and lowercase letters, at least one number, and at least one special character.";
+
 function accountType(value = "staff") {
   const normalized = clean(value, 40).toLowerCase();
   const aliases = { admin: "admin", administrator: "admin", "system administrator": "admin", doctor: "doctor", nurse: "nurse", staff: "staff", receptionist: "staff", "medical assistant": "staff", "lab technician": "staff" };
@@ -78,7 +90,7 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
     return { user, staff, profile: staff };
   }
 
-  async function create(input, actor) {
+  async function create(input, actor, { emailVerified = false } = {}) {
     if (pins) {
       pins.ready();
       if (typeof input.pin !== "string" || !/^\d{6}$/.test(input.pin) || input.pin !== input.confirmPin) throw new AccountError("Create and confirm the same 6-digit PIN.");
@@ -90,13 +102,11 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
     const email = String(input.email || "").trim().toLowerCase();
     const password = input.password;
     if (!name || !contact || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new AccountError("Enter the account holder's name, contact number, and email address.");
-    if (typeof password !== "string" || password.length < 8 || password.length > 128) {
-      throw new AccountError("Enter a password with 8–128 characters.");
-    }
+    if (!validAccountPassword(password)) throw new AccountError(ACCOUNT_PASSWORD_MESSAGE);
     const publicId = await reservePublicId(type);
     let createdAuth;
     try {
-      createdAuth = await auth.createUser({ email, password, displayName: name, emailVerified: false, disabled: false });
+      createdAuth = await auth.createUser({ email, password, displayName: name, emailVerified: emailVerified === true, disabled: false });
     } catch (error) {
       if (error.code === "auth/email-already-exists") throw new AccountError("Email is already registered. Use a different email or sign in.", 409, "EMAIL_EXISTS");
       throw error;
@@ -107,7 +117,7 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
       id: uid, uid, userId: uid, publicId, accountId: publicId,
       accountType: type, accountRole: type === "admin" ? "admin" : "staff", role: type === "admin" ? "admin" : "staff",
       name, fullName: name, displayName: name, email, normalizedEmail: email,
-      contact, contactNumber: contact, emailVerified: false, active: true, status: "active", accountStatus: "active",
+      contact, contactNumber: contact, emailVerified: emailVerified === true, active: true, status: "active", accountStatus: "active",
       createdAt: timestamp, updatedAt: timestamp, createdBy: actor.uid,
     };
     const user = { ...base, authProviderId: "password" };
@@ -127,7 +137,7 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
     const password = input.password;
     if (password !== undefined) {
       if (ownProfile || actor?.role !== "admin") throw new AccountError("Only administrators can set account passwords through account management.", 403);
-      if (typeof password !== "string" || password.length < 8 || password.length > 128) throw new AccountError("Enter a password with 8–128 characters.");
+      if (!validAccountPassword(password)) throw new AccountError(ACCOUNT_PASSWORD_MESSAGE);
     }
     const uid = accountId(uidValue);
     const [userSnapshot, staffSnapshot] = await Promise.all([database.ref(`users/${uid}`).get(), database.ref(`staff/${uid}`).get()]);

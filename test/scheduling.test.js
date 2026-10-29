@@ -209,7 +209,7 @@ test("idempotent retry succeeds after capacity fills without creating a second r
   assert.deepEqual(retry, first);
   assert.equal(Object.keys(root.appointments).length, 1);
   assert.equal(booking.listSlots(root, SERVICE, DAY, NOW).slots[0].bookedCount, 1);
-  assert.throws(() => booking.createBooking(root, input("appointment_2"), patient, NOW), { code: "SLOT_FULL" });
+  assert.throws(() => booking.createBooking(root, input("appointment_2"), patient, NOW), { code: "ACTIVE_APPOINTMENT_EXISTS" });
 });
 
 test("patient cancellation verifies owner and releases exactly one reservation", () => {
@@ -228,7 +228,7 @@ test("legacy RTDB appointments count once; cancellation frees capacity; other se
   root.appointments.legacy = { id: "legacy", userId: "patient_a", reason: SERVICE, scheduledAt: `${DAY}T07:00:00+08:00`, status: "confirmed" };
   root.appointments.other = { ...root.appointments.legacy, id: "other", reason: "ECG" };
   save(root, oneSlot(2));
-  booking.createBooking(root, input(), patient, NOW);
+  booking.createBooking(root, { ...input(), userId: patient.uid, visitType: "clinic" }, admin, NOW);
   assert.equal(booking.listSlots(root, SERVICE, DAY, NOW).slots[0].bookedCount, 2);
   root.appointments.legacy.status = "cancelled";
   assert.equal(booking.listSlots(root, SERVICE, DAY, NOW).slots[0].bookedCount, 1);
@@ -238,7 +238,7 @@ test("admin changes use optimistic revision, reject overlap and capacity below b
   const root = seed();
   assert.equal(save(root, oneSlot(2)).revision, 1);
   booking.createBooking(root, input(), patient, NOW);
-  booking.createBooking(root, input("appointment_2"), patient, NOW);
+  booking.createBooking(root, { ...input("appointment_2"), userId: patient.uid, visitType: "clinic" }, admin, NOW);
   assert.throws(() => save(root, oneSlot(3), 0), { code: "SCHEDULE_CONFLICT" });
   assert.throws(() => save(root, oneSlot(1), 1), { code: "SLOT_HAS_BOOKINGS" });
   assert.throws(() => save(root, oneSlot(2, { isBreak: true }), 1), { code: "SLOT_HAS_BOOKINGS" });
@@ -261,9 +261,10 @@ test("removing booked intervals preserves them as closed; removing empty ones wo
 
 test("admin rescheduling enforces target capacity and atomically moves availability", () => {
   const root = seed();
-  booking.createBooking(root, input(), patient, NOW);
-  booking.createBooking(root, input("appointment_2", "08:00"), patient, NOW);
-  booking.createBooking(root, input("appointment_3", "08:00"), patient, NOW);
+  save(root, booking.defaultSlots(DAY));
+  booking.createBooking(root, { ...input(), userId: patient.uid, visitType: "clinic" }, admin, NOW);
+  booking.createBooking(root, { ...input("appointment_2", "08:00"), userId: patient.uid, visitType: "clinic" }, admin, NOW);
+  booking.createBooking(root, { ...input("appointment_3", "08:00"), userId: patient.uid, visitType: "clinic" }, admin, NOW);
   assert.throws(() => booking.updateBooking(root, "appointment_1", { scheduledAt: `${DAY}T08:00:00+08:00` }, admin, NOW, "schedule"), { code: "SLOT_FULL" });
   booking.updateBooking(root, "appointment_1", { scheduledAt: `${DAY}T09:00:00+08:00`, destinationFloor: "2nd Floor", destinationRoom: "Room 101" }, admin, NOW, "schedule");
   const slots = booking.listSlots(root, SERVICE, DAY, NOW).slots;
@@ -333,6 +334,29 @@ function requestFixture(initial = seed(), legacy = {}, coldCache = null) {
     },
   };
 }
+
+test("patient cancellation commits one staff alert with its appointment and rejects foreign owners", async () => {
+  const root = seed();
+  const appointment = booking.createBooking(root, input(), patient, NOW);
+  const fixture = requestFixture(root);
+  const request = (token = patient.uid) => fixture.request("post", "/api/booking/appointments/:appointmentId/cancel",
+    { reason: "Patient changed plans" }, token, { params: { appointmentId: appointment.appointmentNumber } });
+  const denied = await request("patient_b");
+  assert.equal(denied.status, 403);
+  assert.deepEqual(fixture.read(), root);
+  const results = await Promise.all([request(), request()]);
+  assert.ok(results.every(result => result.status === 200));
+  const saved = fixture.read();
+  const notices = Object.values(saved.notifications).filter(notice => notice.type === "appointment_cancelled" && notice.userId === "desktop-staff");
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].referenceId, appointment.id);
+  assert.equal(notices[0].isRead, false);
+  assert.match(notices[0].message, /Saved Profile Name/);
+  assert.match(notices[0].message, /Patient changed plans/);
+  assert.equal(saved.appointments[appointment.id].status, "cancelled");
+  assert.equal(saved.appointments[appointment.id].cancelledAt, notices[0].createdAt);
+  assert.equal(Object.keys(saved.queueEntries || {}).length, 0);
+});
 
 test("cancel and complete succeed with an initially empty or partial transaction cache", async () => {
   for (const coldCache of [null, { users: { admin_a: { role: "admin" } } }]) {
@@ -431,7 +455,7 @@ test("legacy Firestore-only bookings count and import on a confirmed write witho
   const root = seed();
   save(root, oneSlot(2));
   const legacy = {
-    legacy_only: { id: "legacy_only", userId: patient.uid, patientName: "Legacy Patient", serviceName: SERVICE, scheduledAt: `${DAY}T07:00:00+08:00`, status: "confirmed" },
+    legacy_only: { id: "legacy_only", source: "mobile", userId: "legacy_patient", patientName: "Legacy Patient", serviceName: SERVICE, scheduledAt: `${DAY}T07:00:00+08:00`, status: "confirmed" },
     stale_copy: { id: "stale_copy", userId: patient.uid, serviceName: SERVICE, scheduledAt: `${DAY}T07:00:00+08:00`, status: "confirmed" },
   };
   root.appointments.stale_copy = { ...legacy.stale_copy, status: "cancelled" };
@@ -439,11 +463,11 @@ test("legacy Firestore-only bookings count and import on a confirmed write witho
   const read = await fixture.request("get", "/api/booking/slots", {}, patient.uid, { query: { service: SERVICE, date: DAY } });
   assert.equal(read.body.slots[0].bookedCount, 1);
   assert.equal(fixture.read().appointments.legacy_only, undefined, "Availability reads do not migrate data");
-  const created = await fixture.request("post", "/api/booking/appointments", input());
+  const created = await fixture.request("post", "/api/booking/appointments", input("appointment_1", "09:00"));
   assert.equal(created.status, 201);
   assert.equal(fixture.read().appointments.legacy_only.id, "legacy_only");
   assert.equal(fixture.read().appointments.stale_copy.status, "cancelled");
-  const full = await fixture.request("post", "/api/booking/appointments", input("too_many"));
+  const full = await fixture.request("post", "/api/booking/appointments", input("too_many"), "patient_b");
   assert.equal(full.status, 409);
   assert.equal(full.body.code, "SLOT_FULL");
 });
@@ -475,13 +499,13 @@ test("staff can process bookings but cannot edit service slot configuration", as
 test("booking persists the ordered services and rejects retries with a different plan",()=>{
   const root=seed();
   root.services={lab:{service_name:SERVICE,name:SERVICE,status:"active",floor:"2nd Floor",room:"Lab"},ecg:{service_name:"ECG",name:"ECG",status:"active",floor:"2nd Floor",room:"ECG Room"}};
-  const request={...input(),serviceIds:["lab","ecg"]};
-  const created=booking.createBooking(root,request,patient,NOW);
+  const request={...input(),userId:patient.uid,visitType:"clinic",serviceIds:["lab","ecg"]};
+  const created=booking.createBooking(root,request,admin,NOW);
   assert.deepEqual(created.serviceIds,["lab","ecg"]);
   assert.deepEqual(Object.values(root.appointmentServices).map(s=>s.sequence_number),[1,2]);
-  booking.createBooking(root,request,patient,NOW);
+  booking.createBooking(root,request,admin,NOW);
   assert.equal(Object.keys(root.appointmentServices).length,2);
-  assert.throws(()=>booking.createBooking(root,{...request,serviceIds:["lab"]},patient,NOW),{code:"APPOINTMENT_CONFLICT"});
+  assert.throws(()=>booking.createBooking(root,{...request,serviceIds:["lab"]},admin,NOW),{code:"APPOINTMENT_CONFLICT"});
   booking.updateBooking(root, created.id, { status: "completed" }, admin, NOW, "status");
   assert.equal(created.status, "completed");
   assert.ok(Object.values(root.appointmentServices).every((step) => step.completed_at));

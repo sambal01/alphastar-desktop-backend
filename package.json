@@ -6,7 +6,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/staff-account-pin.js && node --check src/email-delivery.js && node --check src/scheduling-routes.js && node --check src/queue-routes.js && node --check src/account-service.js && node --check src/sync-routes.js && node --check src/smpe-routes.js",
+    "check": "node --check src/server.js && node --check src/staff-account-pin.js && node --check src/email-delivery.js && node --check src/scheduling-routes.js && node --check src/queue-routes.js && node --check src/account-service.js && node --check src/sync-routes.js && node --check src/smpe-routes.js && node --check src/patient-record-routes.js && node --check src/inventory-routes.js && node --check src/patient-audit.js",
     "test": "node --test",
     "renumber:queue-history": "node scripts/renumber-queue-history.js"
   },

@@ -111,7 +111,8 @@ test("two concurrent staff approvals are idempotent and keep the first reviewer"
   assert.equal(replies.filter(reply => reply.body.duplicate).length, 1);
   assert.equal(f.read().medicalRecords.canonical_one.reviewHistory.length, 1);
   assert.equal(f.read().medicalRecords.canonical_one.reviewedBy, "staff_one");
-  assert.equal(Object.keys(f.read().auditLogs).length, 1);
+  assert.equal(Object.values(f.read().auditLogs).filter(row => row.action === "smpe_approved").length, 1);
+  assert.equal(Object.keys(f.read().auditLogs).length, 2); // Submission + one approval.
   assert.equal(f.count(), 0);
 });
 test("patient resubmission preserves the exact approved history while current form becomes pending", async () => {

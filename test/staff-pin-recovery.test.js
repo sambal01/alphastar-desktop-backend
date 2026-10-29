@@ -202,7 +202,7 @@ test("invalid OTP formats never consume a valid challenge; backend advertises re
   }
   assert.equal((await f.request("verify", { challengeToken: sent.result.challengeToken, code: f.latestCode() })).status, 200);
   assert.ok(source.indexOf('app.use(["/api/staff", "/api/staff-auth"], createStaffAccessGuard') < source.indexOf('app.post("/api/staff-auth/pin/recovery/send"'));
-  assert.match(source, /capabilities: \{ staffAccountPin: 1, staffPinRecovery: 1 \}/);
+  assert.match(source, /capabilities: \{ staffAccountPin: 1, staffPinRecovery: 1(?:, [^}]+)? \}/);
 });
 test("a reset grant is never issued when the grant transaction does not commit", async () => {
   const pins = createStaffAccountPin({ enabled: true, pepper: "a".repeat(64),

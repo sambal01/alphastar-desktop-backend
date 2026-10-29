@@ -74,8 +74,10 @@ test("profile PIN change requires the current PIN and confirmation", async () =>
   assert.deepEqual(JSON.parse(JSON.stringify(r.calls.find(call => call[0] === "change").slice(1))),
     [{ uid: "canonical-admin", authProviderId: "password", authTime: r.calls.find(call => call[0] === "change")[1].authTime }, "654321", "proof"]);
 });
-test("account creation no longer consumes emailed verification tokens", () => {
+test("new account creation requires an emailed proof separately from the saved sign-in PIN", () => {
   const create = source.slice(source.indexOf('app.post("/api/staff/accounts",'), source.indexOf('app.patch("/api/staff/accounts/:userId"'));
-  assert.doesNotMatch(create, /consumeRegistrationToken|sendMail\(/);
+  assert.match(create, /consumeRegistrationToken/);
+  assert.match(create, /expectedMetadata: \{ adminUid: actor.uid, accountType: type \}/);
+  assert.doesNotMatch(create, /sendMail\(/);
   assert.match(create, /service\.create/);
 });

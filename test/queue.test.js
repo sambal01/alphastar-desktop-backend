@@ -134,7 +134,7 @@ test("confirmed appointment destination stays consistent after queue decoration"
 test("new walk-ins in an occupied room wait until it is released; different floors serve together", () => {
   const root = seed();
   for (const [id, floor] of [["first", "2nd Floor"], ["waiting", "2nd Floor"], ["other_floor", "3rd Floor"]]) {
-    queue.addQueueEntry(root, { patientName: "Walk-in", serviceName: "ECG", floor, room: "Room 101" }, staff, NOW, id);
+    queue.addQueueEntry(root, { patientName: `Walk-in ${id}`, serviceName: "ECG", floor, room: "Room 101" }, staff, NOW, id);
   }
   queue.changeQueueEntry(root, "first", { status: "in_service" }, staff, NOW);
   for (const status of ["called", "in_service"]) {
@@ -169,8 +169,8 @@ test("queue number and estimated wait are automatic using active patients at the
   root.services = { ecg: { service_name: "ECG", estimated_duration: 20, status: "active" } };
   const input = { patientName: "Walk-in", serviceName: "ECG", floor: "2nd Floor", room: "Room 101" };
   const first = queue.addQueueEntry(root, input, staff, NOW, "auto_first").entry;
-  const second = queue.addQueueEntry(root, input, staff, NOW + 1, "auto_second").entry;
-  const otherRoom = queue.addQueueEntry(root, { ...input, room: "Room 102" }, staff, NOW + 2, "auto_other").entry;
+  const second = queue.addQueueEntry(root, { ...input, patientName: "Second Walk-in" }, staff, NOW + 1, "auto_second").entry;
+  const otherRoom = queue.addQueueEntry(root, { ...input, patientName: "Other Walk-in", room: "Room 102" }, staff, NOW + 2, "auto_other").entry;
   assert.equal(first.queueNo, "A-001");
   assert.equal(first.estimatedWaitMinutes, 0);
   assert.equal(second.queueNo, "A-002");
@@ -186,6 +186,7 @@ test("queue numbers stay unique when a new clinic day starts", () => {
   const root = seed();
   const input = { patientName: "Walk-in", serviceName: "ECG", floor: "2nd Floor", room: "Room 101" };
   const first = queue.addQueueEntry(root, input, staff, NOW, "day_one").entry;
+  queue.changeQueueEntry(root, "day_one", { status: "done" }, staff, NOW + 1);
   const second = queue.addQueueEntry(root, input, staff, NOW + 24 * 60 * 60 * 1000, "day_two").entry;
 
   assert.equal(first.queueNo, "A-001");
@@ -360,6 +361,16 @@ test("inactive canonical account status and flags deny queue and legacy staff ac
   }
 });
 
+test("concurrent additions for one patient and different services commit only one ticket", async () => {
+  const f = fixture();
+  const attempts = await Promise.all(['ECG', 'X-Ray'].map((serviceName, index) => f.request('post', '/api/staff/queue', {
+    id: `same_patient_${index}`, userId: 'patient_auth', patientName: 'Synthetic Patient', serviceName, floor: '1st Floor', room: 'Room 101',
+  }, 'staff_auth')));
+  assert.deepEqual(attempts.map(result => result.status).sort(), [201, 409]);
+  assert.equal(attempts.find(result => result.status === 409).body.code, 'QUEUE_PATIENT_ALREADY_QUEUED');
+  assert.equal(Object.keys(f.read().queueEntries).length, 1);
+});
+
 test("concurrent staff additions allocate distinct numbers and same appointment retries deduplicate", async () => {
   const f = fixture();
   const responses = await Promise.all([
@@ -483,7 +494,69 @@ test("real HTTP stream receives add, serving and removal events without reconnec
   }
 });
 
+test("calling reserves a floor and room until release, including Proceed to Floor", () => {
+  const root = seed();
+  root.queueEntries = {
+    first: { id: "first", status: "waiting", floor: "2nd Floor", room: "Lab", queueDate: DAY },
+    second: { id: "second", status: "waiting", floor: "2nd Floor", room: "Lab", queueDate: DAY },
+    other: { id: "other", status: "waiting", floor: "3rd Floor", room: "Lab", queueDate: DAY },
+  };
+  queue.changeQueueEntry(root, "first", { status: "called" }, staff, NOW);
+  for (const status of ["called", "in_service", "proceed_to_floor"]) {
+    assert.throws(() => queue.changeQueueEntry(root, "second", { status }, staff, NOW), error => error.code === "QUEUE_DESTINATION_OCCUPIED");
+  }
+  queue.changeQueueEntry(root, "first", { status: "proceed_to_floor" }, staff, NOW + 1);
+  root.queueEntries.first.journeyStatus = "proceed_to_floor";
+  assert.throws(() => queue.changeQueueEntry(root, "second", { status: "called" }, staff, NOW + 2), error => error.code === "QUEUE_DESTINATION_OCCUPIED");
+  queue.changeQueueEntry(root, "other", { status: "called" }, staff, NOW + 3);
+  assert.equal(root.queueEntries.other.status, "called", "same room name on another floor is independent");
+  queue.changeQueueEntry(root, "first", { status: "in_service" }, staff, NOW + 4);
+  queue.changeQueueEntry(root, "first", { status: "done" }, staff, NOW + 5);
+  queue.changeQueueEntry(root, "second", { status: "called" }, staff, NOW + 6);
+  assert.equal(root.queueEntries.second.status, "called");
+});
+
+test("simultaneous staff calls reserve one destination atomically and cancellation releases it", async () => {
+  const initial = seed();
+  initial.queueEntries = Object.fromEntries(["first", "second"].map(id => [id, { id, status: "waiting", floor: "1st Floor", room: "Treatment", queueDate: DAY }]));
+  const f = fixture(initial);
+  const patch = (id, status) => f.request("patch", "/api/staff/queue/:queueId", { status }, "staff_auth", { queueId: id });
+  const results = await Promise.all([patch("first", "called"), patch("second", "called")]);
+  assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+  const winner = ["first", "second"].find(id => f.read().queueEntries[id].status === "called");
+  const loser = winner === "first" ? "second" : "first";
+  assert.equal((await patch(winner, "cancelled")).status, 200);
+  assert.equal((await patch(loser, "called")).status, 200);
+});
+
 const journey = require("../src/service-journey");
+test("a configured three-floor visit keeps one ticket and advances only after staff complete each service", async () => {
+  const initial = seed();
+  initial.services = {
+    first: { service_name: "Complete Laboratory", floor: "1st Floor", room: "Room A", status: "active", estimated_duration: 30 },
+    second: { service_name: "Synthetic second service", floor: "2nd Floor", room: "Room B", status: "active", estimated_duration: 30 },
+    third: { service_name: "Synthetic third service", floor: "3rd Floor", room: "Room C", status: "active", estimated_duration: 30 },
+  };
+  journey.plan(initial, initial.appointments.apt_one, ["first", "second", "third"]);
+  const f = fixture(initial);
+  await f.request("post", "/api/staff/queue", { id: "three_floor_visit", appointmentId: "apt_one" }, "staff_auth");
+  const ticket = f.read().queueEntries.three_floor_visit.queueNo;
+  for (const floor of ["1st Floor", "2nd Floor", "3rd Floor"]) {
+    let row = f.read().queueEntries.three_floor_visit;
+    assert.equal(row.floor, floor); assert.equal(row.status, "waiting"); assert.equal(row.queueNo, ticket);
+    const patch = status => f.request("patch", "/api/staff/queue/:queueId", { status, appointmentServiceId: row.appointmentServiceId }, "staff_auth", { queueId: "three_floor_visit" });
+    assert.equal((await patch("called")).status, 200);
+    assert.equal((await patch("proceed_to_floor")).status, 200);
+    assert.equal(f.read().queueEntries.three_floor_visit.journeyStatus, "proceed_to_floor");
+    assert.equal((await patch("in_service")).status, 200);
+    assert.equal(f.read().queueEntries.three_floor_visit.floor, floor, "calling/starting never skips a service");
+    assert.equal((await patch("done")).status, 200);
+    assert.equal(f.read().appointments.apt_one.status, floor === "3rd Floor" ? "completed" : "in_progress");
+  }
+  assert.equal(Object.keys(f.read().queueEntries).length, 1);
+  assert.equal(Object.keys(f.read().notifications).length, 3);
+  assert.equal((await f.request("get", "/api/queue/live")).body.nowServing.length, 0);
+});
 function visitSeed() {
   const root=seed();
   root.users.admin_auth={role:"admin"};

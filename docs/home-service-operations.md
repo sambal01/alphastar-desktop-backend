@@ -1,0 +1,14 @@
+# Home-service booking and patient updates
+
+Contract for both the patient mobile and staff desktop backends. Existing clinic-only booking is unchanged.
+
+- Timezone: Asia/Manila. Home-service starts: 07:00, 09:00, 13:00; ends: 09:00, 11:00, 15:00. Lunch 12:00–13:00 and travel/service buffers 11:00–12:00, 15:00–16:00 are not bookable.
+- Three patients per date across all home services; one patient per slot. Pending, approved/confirmed/scheduled, on-the-way and completed visits consume capacity. Cancellation releases capacity. Root RTDB transactions recheck both limits and overlap; request IDs are idempotent. Saved legacy appointments retain their times and block overlapping new windows.
+- GET /api/booking/slots and /calendar remain authenticated aggregate-only availability. Policy marker `homeServicePolicy: two-hour-v1`, dailyCapacity 3, slotCapacity 1. Home-service schedule edits may close/reopen only these windows, never add buffer/lunch slots or raise capacity.
+- Existing POST /api/booking/appointments and PATCH /api/staff/appointments/:id/decision or /schedule enforce this policy. Staff decisions accept `on_the_way` only after approval, on the scheduled Philippine date, with an authorized admin/staff account. This explicit staff action records departure and creates one patient-addressed notification; it is not inferred from time.
+- POST /api/staff/appointments/:id/update accepts `{requestId, message, expectedUpdatedAt?}`. Admin/staff only, active approved/on-the-way home visits only, message 1–500 characters. Retries with the same ID/content are idempotent; conflicting reuse returns 409. Delay updates do not change the saved slot.
+- Confirmed home visits get one reminder in the hour before their latest saved start, never for cancelled/pending visits. Reminder IDs include canonical record key and scheduled instant. Reminders and staff updates are saved before any push attempt.
+- POST /api/patient/push-device registers `{token, enabled, bindingId?}` for the authenticated patient, ignoring supplied user IDs. Tokens are private server-owned data, bound to one account at a time. Disabling removes the matching token binding; stale binding cleanup cannot remove a newer session's registration.
+- Durable push jobs use transactional claims, per-device delivery state and schedule/cancellation rechecks before sending. Provider acceptance is not proof of device delivery. Check receipts and disable DeviceNotRegistered tokens. Ambiguous transport failures cannot guarantee exactly-once push delivery; the saved in-app notice remains the source of truth.
+
+Local verification uses isolated database/auth fixtures and a local HTTP push-provider stand-in, never real patient records or real push recipients. Physical-device delivery requires an Expo project ID, FCM/APNs credentials and a rebuilt native app; hosting/deployment is a separate release step.
