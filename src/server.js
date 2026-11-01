@@ -12,6 +12,7 @@ const { registerSmpeRoutes } = require("./smpe-routes");
 const { registerPatientRecordRoutes } = require("./patient-record-routes");
 const { registerInventoryRoutes } = require("./inventory-routes");
 const { registerSyncRoutes } = require("./sync-routes");
+const { registerHumanChatRoutes } = require("./human-chat");
 const { createPatientAuthenticatorAccess } = require("./patient-authenticator-access");
 const { accountType: desktopAccountType, requireAdministrator, createAccountService } = require("./account-service");
 const { createStaffAccountPin } = require("./staff-account-pin");
@@ -105,7 +106,7 @@ const dataFile = path.resolve(
 );
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "10mb", verify(req, _res, buffer) { if (req.path === "/api/support/tawk/webhook") req.rawBody = buffer; } }));
 const patientAuthenticatorAccess = createPatientAuthenticatorAccess({ getFirebaseApp: firebaseAdminApp, getAuth, getDatabase });
 app.use("/api", patientAuthenticatorAccess.middleware);
 app.use((req, res, next) => {
@@ -4414,6 +4415,7 @@ registerSmpeRoutes(app);
 registerPatientRecordRoutes(app, { verifyPatientUid: uid => getAuth(firebaseAdminApp()).getUser(uid) });
 registerInventoryRoutes(app);
 registerSyncRoutes(app, { getFirebaseApp: firebaseAdminApp, assertAuthenticatorAccess: patientAuthenticatorAccess.assertAccess });
+registerHumanChatRoutes(app, { getFirebaseApp: firebaseAdminApp });
 
 app.post("/api/staff/appointments", async (req, res) => {
   const actor = actorFromRequest(req);
