@@ -1,6 +1,7 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict");
-const {registerNativeChatRoutes,readNativeChat}=require("../src/native-chat");
+const {readNativeChat}=require("../src/native-chat");
+const {registerHumanChatRoutes}=require("../src/human-chat");
 function fixture(){
   let now=Date.parse("2026-11-02T02:00:00Z");
   const root={users:{"patient-a":{role:"patient",fullName:"Synthetic Patient A",email:"a@example.test"},"patient-b":{role:"patient",fullName:"Synthetic Patient B",email:"b@example.test"}}},handlers=new Map(),queries=[];
@@ -17,61 +18,230 @@ function fixture(){
     };
   }
   const db={ref};
-  registerNativeChatRoutes({post(path,handler){handlers.set("POST "+path,handler);},get(path,handler){handlers.set("GET "+path,handler);}},{
+  registerHumanChatRoutes({post(path,handler){handlers.set("POST "+path,handler);},get(path,handler){handlers.set("GET "+path,handler);}},{
     now:()=>now,getFirebaseApp:()=>({}),getDatabase:()=>db,getAuth:()=>({async verifyIdToken(token,revoked){assert.equal(revoked,true);if(!root.users[token])throw Error("expired");return {uid:token,email:root.users[token].email};}}),
   });
   async function invoke(method,path,req={}){const res={code:200,set(){return this;},status(code){this.code=code;return this;},json(body){this.body=body;return this;}};await handlers.get(method+" "+path)({headers:{},params:{},query:{},ip:"synthetic-ip",...req},res);return res;}
   const openGuest=()=>invoke("POST","/api/support/chats",{body:{name:"Synthetic Visitor",email:"guest@example.test",consent:true}});
   const guest=(id,token,body)=>({params:{id},headers:{"x-alphastar-chat-token":token},...(body?{body}:{})});
   const patient=(uid,extra={})=>({headers:{authorization:"Bearer "+uid},...extra});
-  return {root,db,queries,invoke,openGuest,guest,patient,advance:ms=>{now+=ms;}};
+  return {root,db,queries,handlers,invoke,openGuest,guest,patient,advance:ms=>{now+=ms;}};
 }
-test("guest conversations require consent and random capabilities, never lookup by email",async()=>{
+
+const staff = (id, uid = "staff-a", body = {}, role = "staff") => ({ params: { id }, staffAccess: { actor: { uid, role } }, body });
+async function requestGuest(f, opened) { return f.invoke("POST", "/api/support/chats/:id/request", f.guest(opened.id, opened.token, { cycle: 1 })); }
+async function connect(f, id, identity = "anonymous", uid = "staff-a") { return f.invoke("POST", "/api/staff/human-chats/:id/connect", staff(id, uid, { cycle: 1, identity })); }
+
+test("guest consent, welcome, capability ownership and private metadata", async () => {
  const f=fixture();
  assert.equal((await f.invoke("POST","/api/support/chats",{body:{name:"Synthetic",email:"guest@example.test",consent:false}})).code,400);
- const first=await f.openGuest(),second=await f.openGuest();assert.equal(first.code,200);assert.notEqual(first.body.id,second.body.id);assert.notEqual(first.body.token,second.body.token);
- assert.match(first.body.token,/^[a-f0-9]{64}$/);assert.equal(Object.keys(f.root.notifications||{}).length,0);
- assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(first.body.id,second.body.token))).code,401);
- assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(first.body.id,first.body.token))).code,200);
- assert.doesNotMatch(JSON.stringify(first.body.conversation),/tokenHash|expiresAt|uid/);
- f.advance(25*3600000);assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(first.body.id,first.body.token))).code,401);
+ const first=(await f.openGuest()).body,second=(await f.openGuest()).body;
+ assert.notEqual(first.id,second.id); assert.notEqual(first.token,second.token);
+ assert.equal(first.conversation.status,"welcome");
+ assert.equal(first.conversation.messages[0].sender,"system");
+ assert.match(first.conversation.messages[0].text,/Welcome to AlphaStar/);
+ assert.equal(Object.keys(f.root.notifications||{}).length,0);
+ assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(first.id,second.token))).code,401);
+ assert.doesNotMatch(JSON.stringify(first.conversation),/_outbox|_accepted|_readBy|tokenHash|_connection|_patientUid/);
+ f.advance(25*3600000);assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(first.id,first.token))).code,401);
 });
-test("guest messages and desktop replies persist, are idempotent and notify staff once per message",async()=>{
- const f=fixture(),opened=await f.openGuest(),{id,token}=opened.body;
- const req=f.guest(id,token,{text:"Synthetic question",clientId:"a".repeat(32)});
- const [one,two]=await Promise.all([f.invoke("POST","/api/support/chats/:id/messages",req),f.invoke("POST","/api/support/chats/:id/messages",req)]);
- assert.equal(one.code,200);assert.equal(two.code,200);assert.equal(one.body.message.id,two.body.message.id);
- assert.equal(Object.keys(f.root.nativeChatMessages[id]).length,1);assert.equal(Object.keys(f.root.notifications).length,1);
- const notice=Object.values(f.root.notifications)[0];notice.isRead=true;
- await f.invoke("POST","/api/support/chats/:id/messages",req);assert.equal(notice.isRead,true);
- assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",{params:{id},body:{text:"Unauthorized",clientId:"b".repeat(32)}})).code,403);
- f.advance(1000);const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",{params:{id},staffAccess:{actor:{uid:"staff-a"}},body:{text:"Synthetic answer",clientId:"b".repeat(32)}});assert.equal(reply.code,200);
- const result=await f.invoke("GET","/api/support/chats/:id",f.guest(id,token));assert.equal(result.body.conversation.messages.length,2);assert.equal(result.body.conversation.messages[1].sender,"staff");
- assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{text:"Changed retry",clientId:"a".repeat(32)}))).code,409);
+
+test("request is idempotent, notifies staff and records the named visitor and System acknowledgement",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body;
+ const [a,b]=await Promise.all([requestGuest(f,opened),requestGuest(f,opened)]);
+ assert.equal(a.code,200);assert.equal(b.code,200);
+ assert.equal(a.body.conversation.status,"waiting");
+ const messages=a.body.conversation.messages;
+ assert.deepEqual(messages.map(row=>row.sender),["system","visitor","system"]);
+ assert.equal(messages[1].name,"Synthetic Visitor");
+ assert.match(messages[2].text,/24 hours or longer/);
+ assert.equal(Object.keys(f.root.notifications).length,1);
+ const notice=Object.values(f.root.notifications)[0];
+ assert.deepEqual(notice.targetRoles,["admin","staff"]);assert.equal(notice.referenceId,opened.id);
 });
-test("mobile chat resumes only for its authenticated owner, protects MFA, and saves patient reply notifications",async()=>{
- const f=fixture(),open=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a",{body:{userId:"patient-b"}}));assert.equal(open.code,200);const id=open.body.id;
- const again=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a"));assert.equal(again.body.id,id);
+
+test("connection requires a choice, claims atomically, uses verified first name, and hides real anonymous identity",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;
+ f.root.users["staff-a"]={role:"staff",name:"Saved Real Name"};
+ f.root.staff={"staff-a":{name:"Synthetic Assistant"}};
+ assert.equal((await connect(f,id)).code,409);
+ await requestGuest(f,opened);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/connect",staff(id))).code,400);
+ const [a,b]=await Promise.all([connect(f,id,"first_name"),connect(f,id,"anonymous","staff-b")]);
+ assert.deepEqual([a.code,b.code].sort(),[200,409]);
+ assert.equal(a.body.conversation.connectedName,"Synthetic"); assert.equal(a.body.conversation.canReply,true);
+ const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Synthetic answer",clientId:"a".repeat(32),name:"Forged",staffRole:"admin"}));
+ assert.equal(reply.code,200);assert.equal(reply.body.message.name,"Synthetic");assert.equal(reply.body.message.staffRole,"staff");
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-b",{cycle:1,text:"Other staff",clientId:"b".repeat(32)}))).code,403);
+ const data=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation;
+ assert.doesNotMatch(JSON.stringify(data),/Saved Real|Synthetic Assistant|staff-a|staff-b|Forged|_connection|_outbox/);
+ const anon=(await f.openGuest()).body;await requestGuest(f,anon);await connect(f,anon.id);
+ const anonymous=(await f.invoke("GET","/api/support/chats/:id",f.guest(anon.id,anon.token))).body.conversation;
+ assert.equal(anonymous.connectedName,"Support assistant");assert.doesNotMatch(JSON.stringify(anonymous),/Synthetic Assistant|Saved Real|staff-a/);
+});
+
+test("messages are idempotent, new messages alone increase unread, and reads are per staff",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id);
+ const body={cycle:1,text:"Synthetic question",clientId:"a".repeat(32)},req=f.guest(id,token,body);
+ const [a,b]=await Promise.all([f.invoke("POST","/api/support/chats/:id/messages",req),f.invoke("POST","/api/support/chats/:id/messages",req)]);
+ assert.equal(a.code,200);assert.equal(a.body.message.id,b.body.message.id);
+ assert.equal(f.root.humanChats[id].visitorSequence,2);
+ const lifecycle=require("../src/native-chat-lifecycle");
+ assert.equal(lifecycle.publicSummary(f.root.humanChats[id],{uid:"staff-a"}).unread,true);
+ await f.invoke("POST","/api/staff/human-chats/:id/read",staff(id,"staff-a",{sequence:2}));
+ assert.equal(lifecycle.publicSummary(f.root.humanChats[id],{uid:"staff-a"}).unread,false);
+ assert.equal(lifecycle.publicSummary(f.root.humanChats[id],{uid:"staff-b"}).unread,true);
+ await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Synthetic answer",clientId:"c".repeat(32)}));
+ assert.equal(f.root.humanChats[id].visitorSequence,2);
+ assert.equal(lifecycle.publicSummary(f.root.humanChats[id],{uid:"staff-a"}).unread,false);
+ await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text:"Changed",clientId:"a".repeat(32)})).then(r=>assert.equal(r.code,409));
+ await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text:"Another question",clientId:"b".repeat(32)}));
+ await f.invoke("POST","/api/staff/human-chats/:id/read",staff(id,"staff-a",{sequence:2}));
+ assert.equal(lifecycle.publicSummary(f.root.humanChats[id],{uid:"staff-a"}).unread,true);
+});
+
+test("end saves feedback, history is read-only, new website visits never recover someone else's thread",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,{cycle:1}))).code,400);
+ const endBody={cycle:1,rating:"up",comment:"Synthetic helpful reply"};
+ const ended=await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,endBody));assert.equal(ended.code,200);assert.equal(ended.body.conversation.status,"ended");
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,endBody))).code,200);
+ assert.equal((await requestGuest(f,opened)).code,409);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text:"Too late",clientId:"d".repeat(32)}))).code,409);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Too late",clientId:"e".repeat(32)}))).code,403);
+ assert.doesNotMatch(JSON.stringify(ended.body.conversation),/Synthetic helpful reply/);
+ const authorized=require("../src/native-chat-lifecycle").publicSummary(f.root.humanChats[id],{uid:"staff-a"});
+ assert.equal(authorized.feedback.rating,"up");assert.equal(authorized.feedback.comment,endBody.comment);
+ assert.notEqual((await f.openGuest()).body.id,id);
+});
+
+test("website exit and lost heartbeats end the chat; a delayed heartbeat cannot resurrect it",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body;await requestGuest(f,opened);
+ f.advance(60000);assert.equal((await f.invoke("POST","/api/support/chats/:id/heartbeat",f.guest(opened.id,opened.token,{cycle:1}))).code,200);
+ f.advance(60000);assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(opened.id,opened.token))).body.conversation.status,"waiting");
+ f.advance(91000);assert.equal((await f.invoke("POST","/api/support/chats/:id/heartbeat",f.guest(opened.id,opened.token,{cycle:1}))).code,200);
+ assert.equal(f.root.humanChats[opened.id].status,"ended");
+ const next=(await f.openGuest()).body;await requestGuest(f,next);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/exit",{params:{id:next.id},body:JSON.stringify({cycle:1,token:next.token})})).code,200);
+ assert.equal(f.root.humanChats[next.id].status,"ended");
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/exit",{params:{id:next.id},body:{cycle:1,token:opened.token}})).code,401);
+});
+
+test("mobile persists on exit, enforces its owner and MFA, and can continue an ended conversation in a new cycle",async()=>{
+ const f=fixture(),opened=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a")),id=opened.body.id;
  assert.equal((await f.invoke("GET","/api/patient-support/chats/:id",f.patient("patient-b",{params:{id}}))).code,404);
- assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(id,"a".repeat(64)))).code,401);
- const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",{params:{id},staffAccess:{actor:{uid:"staff-a"}},body:{text:"Synthetic patient update",clientId:"c".repeat(32)}});assert.equal(reply.code,200);
- const notice=Object.values(f.root.notifications)[0];assert.equal(notice.userId,"patient-a");assert.equal(notice.referenceId,id);assert.equal(notice.type,"human_chat");
+ await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
+ await connect(f,id);
+ await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Patient update",clientId:"a".repeat(32)}));
+ assert.ok(Object.values(f.root.notifications).some(n=>n.userId==="patient-a"&&n.referenceId===id));
+ f.advance(24*3600000);
+ const saved=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a"));assert.equal(saved.body.id,id);assert.equal(saved.body.conversation.status,"connected");
+ await f.invoke("POST","/api/patient-support/chats/:id/end",f.patient("patient-a",{params:{id},body:{cycle:1,rating:"down",comment:"Synthetic"}}));
+ const resumed=await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));assert.equal(resumed.code,200);assert.equal(resumed.body.conversation.cycle,2);assert.equal(resumed.body.conversation.status,"waiting");
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Stale reply",clientId:"b".repeat(32)}))).code,409);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:2,text:"Not connected",clientId:"b".repeat(32)}))).code,403);
  f.root.patientAuthenticator={"patient-a":{version:1,enabled:true,revision:"a".repeat(64),provider:"password"}};
  assert.equal((await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a"))).code,401);
  f.root.users["patient-b"].active=false;assert.equal((await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-b"))).code,403);
 });
-test("all messages are retained and older pages use bounded indexed queries",async()=>{
- const f=fixture(),opened=await f.openGuest(),id=opened.body.id;
- f.root.nativeChatMessages||={};f.root.nativeChatMessages[id]={};
- for(let i=0;i<205;i++){const key=i.toString(16).padStart(64,"0");f.root.nativeChatMessages[id][key]={id:key,time:new Date(Date.parse("2026-11-01T00:00:00Z")+i*1000).toISOString(),text:"Synthetic "+i,sender:"visitor",name:""};}
- const latest=await readNativeChat(f.db,id);assert.equal(latest.messages.length,100);assert.ok(latest.before);
- const earlier=await readNativeChat(f.db,id,latest.before);assert.equal(earlier.messages.length,100);const first=await readNativeChat(f.db,id,earlier.before);assert.equal(first.messages.length,5);assert.equal(first.before,"");
- assert.equal(new Set([...latest.messages,...earlier.messages,...first.messages].map(row=>row.id)).size,205);
- assert.equal(Object.keys(f.root.nativeChatMessages[id]).length,205);assert.ok(f.queries.every(query=>query.limit===101&&query.order==="time"));
+
+test("message/end races cannot accept a new event after the end; idempotent earlier sends remain recoverable",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id);
+ const body={cycle:1,text:"Accepted before end",clientId:"a".repeat(32)};
+ const accepted=await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,body));
+ await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,{cycle:1,rating:"up"}));
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,body))).body.message.id,accepted.body.message.id);
+ const results=await Promise.all(Array.from({length:5},(_,i)=>f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text:"Late "+i,clientId:String(i).repeat(32)}))));
+ assert.ok(results.every(r=>r.code===409));
+ assert.equal(f.root.humanChats[id].status,"ended");
 });
-test("invalid ids, empty or oversized text and anonymous patient requests are rejected",async()=>{
- const f=fixture(),opened=await f.openGuest(),{id,token}=opened.body;
+
+test("failed outbox delivery is retried without duplicate transcript entries or notifications",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,id=opened.id,original=f.db.ref;
+ let failed=false;
+ f.db.ref=path=>{const ref=original(path);if(path?.startsWith("notifications/")&&!failed){ref.transaction=async()=>{failed=true;throw Error("Synthetic interruption");};}return ref;};
+ const first=await requestGuest(f,opened);assert.equal(first.code,503);
+ const retried=await requestGuest(f,opened);assert.equal(retried.code,200);
+ assert.equal(retried.body.conversation.messages.filter(m=>m.sender==="visitor").length,1);
+ assert.equal(Object.keys(f.root.notifications).length,1);
+ assert.equal(Object.keys(f.root.humanChats[id]._outbox||{}).length,0);
+});
+
+test("all transcript pages are retained with bounded indexed queries",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,id=opened.id;
+ f.root.nativeChatMessages[id]={};
+ for(let i=0;i<205;i++){const key=i.toString(16).padStart(64,"0");f.root.nativeChatMessages[id][key]={id:key,time:new Date(Date.parse("2026-11-01T00:00:00Z")+i*1000).toISOString(),text:"Synthetic "+i,sender:"visitor",name:""};}
+ const latest=await readNativeChat(f.db,id),earlier=await readNativeChat(f.db,id,latest.before),first=await readNativeChat(f.db,id,earlier.before);
+ assert.equal(latest.messages.length,100);assert.equal(earlier.messages.length,100);assert.equal(first.messages.length,5);assert.equal(first.before,"");
+ assert.equal(new Set([...latest.messages,...earlier.messages,...first.messages].map(row=>row.id)).size,205);
+ assert.ok(f.queries.every(q=>q.limit===101&&q.order==="time"));
+});
+
+test("invalid ids, missing auth, oversized text, and unauthenticated staff are rejected",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;
  assert.equal((await f.invoke("POST","/api/patient-support/chats/open")).code,401);
  assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest("../users",token))).code,400);
- for(const text of ["","x".repeat(2001)])assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{text,clientId:"a".repeat(32)}))).code,400);
+ for(const text of ["","x".repeat(2001)])assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text,clientId:"a".repeat(32)}))).code,400);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/connect",{params:{id},body:{identity:"anonymous",cycle:1}})).code,403);
+});
+
+
+test("staff inbox pages preserve all ended chats, keep private fields server-only and reject malformed cursors", async()=>{
+ const f=fixture(),actor={actor:{uid:"staff-a",role:"staff"}};
+ for(let i=0;i<125;i++){
+   const id=i.toString(16).padStart(64,"0"),at=new Date(Date.parse("2026-11-01T00:00:00Z")+i*1000).toISOString();
+   f.root.humanChats||={};f.root.humanChats[id]={id,provider:"alphastar",lifecycleVersion:2,status:"ended",cycle:1,visitorName:"Synthetic "+i,requestedAt:at,updatedAt:at,_connection:{uid:"private-staff-uid"},_readBy:{"staff-a":2},visitorSequence:2,_feedback:{1:{rating:"up",comment:"Synthetic feedback"}}};
+ }
+ const page=before=>f.invoke("GET","/api/staff/human-chats",{staffAccess:actor,query:before?{before}:{}});
+ const one=await page(),two=await page(one.body.before),three=await page(two.body.before);
+ assert.equal(one.code,200);assert.equal(one.body.conversations.length,50);assert.equal(two.body.conversations.length,50);assert.equal(three.body.conversations.length,25);
+ assert.equal(new Set([...one.body.conversations,...two.body.conversations,...three.body.conversations].map(row=>row.id)).size,125);
+ assert.doesNotMatch(JSON.stringify(one.body),/private-staff-uid|_connection|_readBy|_feedback|_accepted/);
+ assert.equal((await page("bad")).code,400);
+ assert.equal((await f.invoke("GET","/api/staff/human-chats")).code,403);
+ assert.ok(f.queries.every(q=>q.order==="updatedAt"&&q.limit===50));
+});
+
+test("a real text/plain exit POST is parsed without JSON middleware and ends the authenticated guest only",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body;await requestGuest(f,opened);
+ const express=require("express"),app=express();app.use(express.json());
+ app.post("/api/support/chats/:id/exit",f.handlers.get("POST /api/support/chats/:id/exit"));
+ const server=await new Promise(resolve=>{const instance=app.listen(0,"127.0.0.1",()=>resolve(instance));});
+ try{
+   const response=await fetch("http://127.0.0.1:"+server.address().port+"/api/support/chats/"+opened.id+"/exit",{method:"POST",headers:{"Content-Type":"text/plain;charset=UTF-8"},body:JSON.stringify({token:opened.token,cycle:1})});
+   assert.equal(response.status,200);assert.equal(f.root.humanChats[opened.id].status,"ended");
+ }finally{await new Promise(resolve=>server.close(resolve));}
+});
+
+
+test("earlier no-cycle clients keep first-session messaging without fabricated visitor consent or double retries",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;
+ const body={text:"Earlier client question",clientId:"a".repeat(32)};
+ const sent=await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,body));
+ assert.equal(sent.code,200);assert.equal(f.root.humanChats[id].status,"waiting");
+ const rows=Object.values(f.root.nativeChatMessages[id]);
+ assert.equal(rows.filter(m=>m.sender==="visitor").length,1);
+ assert.equal(rows.find(m=>m.sender==="visitor").text,body.text);
+ assert.equal(f.root.humanChats[id].visitorSequence,1);
+ assert.equal(Object.keys(f.root.notifications).length,1);
+ const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{text:"Earlier staff reply",clientId:"b".repeat(32)}));
+ assert.equal(reply.code,200);assert.equal(reply.body.message.name,"Support assistant");
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-b",{text:"Wrong owner",clientId:"c".repeat(32)}))).code,403);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,body))).body.message.id,sent.body.message.id);
+ await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,{cycle:1,rating:"up"}));
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{text:"Too late",clientId:"d".repeat(32)}))).code,409);
+});
+
+test("pre-lifecycle retry ids remain idempotent and missing-cycle callers cannot send into a continued thread",async()=>{
+ const f=fixture(),opened=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a")),id=opened.body.id;
+ const clientId="a".repeat(32),key=require("node:crypto").createHash("sha256").update(id+":patient-a:"+clientId).digest("hex");
+ f.root.nativeChatMessages[id][key]={id:key,sender:"visitor",name:"Patient",text:"Already saved",time:"2026-11-02T00:00:00Z"};
+ const result=await f.invoke("POST","/api/patient-support/chats/:id/messages",f.patient("patient-a",{params:{id},body:{text:"Already saved",clientId}}));
+ assert.equal(result.code,200);assert.equal(result.body.message.id,key);
+ assert.equal(Object.values(f.root.nativeChatMessages[id]).filter(m=>m.text==="Already saved").length,1);
+ await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
+ await f.invoke("POST","/api/patient-support/chats/:id/end",f.patient("patient-a",{params:{id},body:{cycle:1,rating:"up"}}));
+ await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
+ assert.equal((await f.invoke("POST","/api/patient-support/chats/:id/messages",f.patient("patient-a",{params:{id},body:{text:"Outdated draft",clientId:"b".repeat(32)}}))).code,426);
+ assert.equal(f.root.humanChats[id].cycle,2);
 });

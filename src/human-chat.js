@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const { transactionWithLiveSnapshot } = require("./realtime-transaction");
-const { registerNativeChatRoutes, readNativeChat } = require("./native-chat");
+const { registerNativeChatRoutes } = require("./native-chat");
 const PROPERTY_ID = "69c333b43508461c3360e229";
 const idFor = (property, chat) => crypto.createHash("sha256").update(`${property}:${chat}`).digest("hex");
 const clean = (value, max = 255) => typeof value === "string" ? value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim().slice(0, max) : "";
@@ -104,21 +104,28 @@ function registerHumanChatRoutes(app, options) {
     if (!req.staffAccess?.actor?.uid) return res.status(403).json({ ok: false, error: "Clinic staff access required." });
     try { return await handler(req, res); } catch (cause) { return failure(res, cause); }
   };
-  app.get("/api/staff/human-chats", staffRoute(async (_req, res) => {
-    const snapshot = await database().ref("humanChats").orderByChild("updatedAt").limitToLast(50).get();
-    const conversations = Object.values(snapshot.val() || {}).map(({ messages, ...summary }) => summary).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-    return res.json({ ok: true, conversations, configured: true });
+  const native = registerNativeChatRoutes(app, options);
+  app.get("/api/staff/human-chats", staffRoute(async (req, res) => {
+    let query = database().ref("humanChats").orderByChild("updatedAt");
+    if (req.query?.before) {
+      const [time, key] = String(req.query.before).split("|");
+      if (!Number.isFinite(Date.parse(time)) || !/^[a-f0-9]{64}$/.test(key || "")) return res.status(400).json({ ok: false, error: "Invalid chat page." });
+      query = query.endBefore(time, key);
+    }
+    const snapshot = await query.limitToLast(50).get();
+    const rows = Object.values(snapshot.val() || {}).sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)) || a.id.localeCompare(b.id));
+    const conversations = (await Promise.all(Object.values(snapshot.val() || {}).map(({ messages, ...summary }) => native.summary(database(), summary, req.staffAccess.actor)))).filter(row => row.provider !== "alphastar" || row.requestedAt).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    return res.json({ ok: true, conversations, configured: true, before: rows.length === 50 && rows[0].updatedAt ? `${rows[0].updatedAt}|${rows[0].id}` : "" });
   }));
   app.get("/api/staff/human-chats/:id", staffRoute(async (req, res) => {
     if (!/^[a-f0-9]{64}$/.test(req.params.id || "")) return res.status(400).json({ ok: false, error: "Invalid chat reference." });
     const db = database();
     const conversation = (await db.ref(`humanChats/${req.params.id}`).get()).val();
     if (!conversation) return res.status(404).json({ ok: false, error: "This conversation is no longer available." });
-    if (conversation.provider === "alphastar") return res.json({ ok: true, conversation: await readNativeChat(db, req.params.id, req.query?.before) });
+    if (conversation.provider === "alphastar") return res.json({ ok: true, conversation: await native.conversation(db, req.params.id, req.query?.before, req.staffAccess.actor) });
     const messages = (await db.ref(`humanChatMessages/${req.params.id}`).get()).val() || [];
     return res.json({ ok: true, conversation: { ...conversation, messages } });
   }));
-  registerNativeChatRoutes(app, options);
 }
 
 module.exports = { registerHumanChatRoutes, verifySignature, normalizeEvent, applyEvent };
