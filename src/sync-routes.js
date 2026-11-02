@@ -1,7 +1,7 @@
 "use strict";
 
 const STAFF_ROLES = new Set(["admin", "staff", "doctor", "nurse", "receptionist"]);
-const STAFF_PATHS = Object.freeze(["users", "patientProfiles", "staff", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "services", "schedules", "clinicSettings", "inventory", "stockTransactions", "auditLogs"]);
+const STAFF_PATHS = Object.freeze(["users", "patientProfiles", "staff", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "services", "schedules", "clinicSettings", "inventory", "stockTransactions", "auditLogs", "humanChats"]);
 const PATIENT_PATHS = Object.freeze(["users", "patientProfiles", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "payments"]);
 
 class SyncError extends Error {
@@ -41,11 +41,11 @@ function registerSyncRoutes(app, options) {
     try { decoded = await getAuth(firebaseApp).verifyIdToken(token, true); }
     catch { throw new SyncError("Your session expired. Sign in again.", 401, "SYNC_UNAUTHENTICATED"); }
     if (!decoded.uid || /[.#$\[\]/]/.test(decoded.uid) || !Number.isFinite(decoded.exp) || now() >= decoded.exp * 1000) throw new SyncError("Your session expired. Sign in again.", 401, "SYNC_UNAUTHENTICATED");
-    const database = getDatabase(firebaseApp);
     if (options.assertAuthenticatorAccess) {
       try { await options.assertAuthenticatorAccess(decoded); }
       catch (cause) { throw new SyncError("Sign in again to verify your account security.", cause.status === 401 ? 401 : 503, cause.status === 401 ? "SYNC_UNAUTHENTICATED" : "SYNC_UNAVAILABLE"); }
     }
+    const database = getDatabase(firebaseApp);
     const [userSnap, staffSnap] = await Promise.all([database.ref(`users/${decoded.uid}`).get(), database.ref(`staff/${decoded.uid}`).get()]);
     const user = userSnap.val();
     const staff = staffSnap.val();
@@ -59,7 +59,7 @@ function registerSyncRoutes(app, options) {
         const access = await context(req, audience);
         if (req.aborted || res.destroyed) return;
         const { database, decoded, role } = access;
-        const paths = audience === "staff" ? STAFF_PATHS.filter((path) => path !== "auditLogs" || role === "admin") : [...PATIENT_PATHS];
+        const paths = audience === "staff" ? STAFF_PATHS.filter((path) => (path !== "auditLogs" || role === "admin") && (path !== "humanChats" || ["admin", "staff"].includes(role))) : [...PATIENT_PATHS];
         const pending = new Set();
         const ready = new Set();
         const subscriptions = [];
@@ -135,12 +135,20 @@ function registerSyncRoutes(app, options) {
         for (const path of paths) {
           if (ended) break;
           const ref = audience === "staff" ? database.ref(path) : ["users", "patientProfiles"].includes(path) ? database.ref(`${path}/${decoded.uid}`) : database.ref(path).orderByChild("userId").equalTo(decoded.uid);
+          let chatFingerprint;
           const listener = (snapshot) => {
             if (ended) return;
             try {
               if (path === "users") user = audience === "staff" ? snapshot.child(decoded.uid).val() : snapshot.val();
               if (path === "staff") staff = snapshot.child(decoded.uid).val();
               checkSavedAccess();
+              if (path === "humanChats") {
+                // Only inbox/unread changes invalidate the badge. Heartbeats,
+                // drafts/typing and outbox cleanup must not trigger extra reads.
+                const fingerprint = JSON.stringify(Object.values(snapshot.val() || {}).filter(row => row.provider === "alphastar" && (row.requestedAt || row.visitorSequence > 0)).map(row => [row.id, row.visitorSequence || 0, row.status, row._readBy?.[decoded.uid] || 0]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+                if (ready.has(path) && fingerprint === chatFingerprint) return;
+                chatFingerprint = fingerprint;
+              }
               pending.add(path);
               ready.add(path);
               if (ready.size === paths.length) {

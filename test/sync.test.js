@@ -153,6 +153,29 @@ test("staff without an admin role never subscribes to audit logs", async (t) => 
   assert.equal(stream.events()[0].paths.includes("auditLogs"), false);
 });
 
+test("Human Chat invalidations reach authorized staff immediately without message data or typing/heartbeat noise", async t => {
+  const f = fixture(), stream = await f.request("staff", "staff"); t.after(stream.close);
+  await until(() => stream.events().length === 1);
+  f.state.humanChats = { synthetic: { id: "synthetic", provider: "alphastar", requestedAt: "2026-11-02", status: "waiting", visitorSequence: 1, visitorName: "Secret Synthetic Visitor", lastMessage: "Private body", _guestLeaseUntil: 100 } };
+  f.emit(); await until(() => stream.events().length === 2);
+  assert.deepEqual(stream.events()[1], { paths: ["humanChats"] });
+  Object.assign(f.state.humanChats.synthetic, { _guestLeaseUntil: 200, _typing: { visitor: { until: 300 } }, _outbox: {} }); f.emit(); await pause(25);
+  assert.equal(stream.events().length, 2);
+  f.state.humanChats.synthetic.visitorSequence = 2; f.emit(); await until(() => stream.events().length === 3);
+  f.state.humanChats.synthetic._readBy = { staff: 2 }; f.emit(); await until(() => stream.events().length === 4);
+  f.state.humanChats.synthetic._readBy.other = 2; f.emit(); await pause(25); assert.equal(stream.events().length, 4);
+  assert.doesNotMatch(stream.chunks.join(""), /Secret Synthetic|Private body|synthetic|visitorSequence|_readBy|_typing/);
+});
+
+test("patients and non-chat clinic roles never subscribe to Human Chat", async t => {
+  const f = fixture(); f.state.users.nurse = { role: "nurse" }; f.state.staff.nurse = { role: "nurse" };
+  for (const [audience, uid] of [["patient", "patient"], ["staff", "nurse"]]) {
+    const stream = await f.request(audience, uid); t.after(stream.close); await until(() => stream.events().length);
+    assert.equal(stream.events()[0].paths.includes("humanChats"), false);
+    assert.equal([...f.subscriptions].some(row => row.path === "humanChats"), false); stream.close();
+  }
+});
+
 test("patient subscriptions use own records and userId queries, ignoring another patient's changes", async (t) => {
   const f = fixture();
   const stream = await f.request("patient", "patient");
@@ -327,6 +350,13 @@ test("HTTP SSE delivers mobile writes to staff and staff decisions to the owning
   await until(() => patient.events.length === 3);
   assert.deepEqual(patient.events[2], { paths: ["appointments", "notifications"] });
   assert.equal(other.events.length, 1);
+  await until(() => staff.events.length === 3);
+  f.state.humanChats = { support: { id: "support", provider: "alphastar", requestedAt: "2026-11-02", visitorSequence: 1, status: "waiting" } };
+  f.emit(); await until(() => staff.events.length === 4);
+  assert.deepEqual(staff.events[3], { paths: ["humanChats"] });
+  f.state.humanChats.support.visitorSequence = 2; f.emit(); await until(() => staff.events.length === 5);
+  assert.deepEqual(staff.events[4], { paths: ["humanChats"] });
+  assert.equal(patient.events.length, 3); assert.equal(other.events.length, 1);
   await Promise.all([staff.close(), patient.close(), other.close()]);
   await until(() => f.subscriptions.size === 0);
 });
