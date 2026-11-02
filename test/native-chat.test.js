@@ -245,3 +245,62 @@ test("pre-lifecycle retry ids remain idempotent and missing-cycle callers cannot
  assert.equal((await f.invoke("POST","/api/patient-support/chats/:id/messages",f.patient("patient-a",{params:{id},body:{text:"Outdated draft",clientId:"b".repeat(32)}}))).code,426);
  assert.equal(f.root.humanChats[id].cycle,2);
 });
+
+test("desktop receives one notice per conversation, read notices stay read and subsequent patient messages only increase unread sequence", async () => {
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);
+ const noticeId=`native_chat_${id}`;assert.ok(f.root.notifications[noticeId]);
+ f.root.notifications[noticeId].read=true;f.root.notifications[noticeId].isRead=true;
+ for(let i=0;i<4;i++)assert.equal((await f.invoke("POST","/api/support/chats/:id/messages",f.guest(id,token,{cycle:1,text:`Synthetic ${i}`,clientId:String(i).repeat(32)}))).code,200);
+ assert.equal(Object.keys(f.root.notifications).length,1);assert.equal(f.root.notifications[noticeId].read,true);
+ assert.equal(f.root.humanChats[id].visitorSequence,5);
+});
+
+test("typing is owner-authorized, expires, does not save drafts, create notices, change sorting or mark messages read", async () => {
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id,"clinic");
+ const at=f.root.humanChats[id].updatedAt,count=Object.keys(f.root.notifications).length,sequence=f.root.humanChats[id].visitorSequence;
+ const marker={cycle:1,isTyping:true,clientId:"e".repeat(32),sequence:1,text:"Never persist this draft"};
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,marker))).code,200);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/typing",staff(id,"staff-b",marker))).code,403);
+ assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/typing",staff(id,"staff-a",marker))).code,200);
+ let row=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation;
+ assert.ok(row.typing.visitor.expiresAt);assert.ok(row.typing.staff.expiresAt);
+ assert.doesNotMatch(JSON.stringify(row),/staff-a|_typing|clientId|Never persist/);
+ assert.doesNotMatch(JSON.stringify(f.root),/Never persist this draft/);
+ assert.equal(f.root.humanChats[id].updatedAt,at);assert.equal(f.root.humanChats[id].visitorSequence,sequence);assert.equal(Object.keys(f.root.notifications).length,count);
+ f.advance(8001);row=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation;assert.deepEqual(row.typing,{});
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,{...marker,isTyping:"true"}))).code,400);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,{...marker,cycle:2}))).code,409);
+});
+
+test("out-of-order typing cannot resurrect a stopped indicator; send and end clear it and resumed cycles reject old markers", async () => {
+ const f=fixture(),opened=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a")),id=opened.body.id;
+ await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
+ const type=body=>f.invoke("POST","/api/patient-support/chats/:id/typing",f.patient("patient-a",{params:{id},body}));
+ const marker={cycle:1,isTyping:true,clientId:"e".repeat(32),sequence:1};
+ assert.equal((await type(marker)).code,200);
+ await type({...marker,isTyping:false,sequence:3});await type({...marker,sequence:2});
+ assert.deepEqual((await f.invoke("GET","/api/patient-support/chats/:id",f.patient("patient-a",{params:{id}}))).body.conversation.typing,{});
+ await type({...marker,sequence:4});
+ await f.invoke("POST","/api/patient-support/chats/:id/messages",f.patient("patient-a",{params:{id},body:{cycle:1,text:"Sent",clientId:"a".repeat(32)}}));
+ assert.equal(f.root.humanChats[id]._typing.visitor.until,0);
+ await f.invoke("POST","/api/patient-support/chats/:id/end",f.patient("patient-a",{params:{id},body:{cycle:1,rating:"up"}}));
+ assert.equal((await type({...marker,sequence:5})).code,409);
+ await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
+ assert.equal((await type({...marker,sequence:6})).code,409);
+ assert.equal((await f.invoke("POST","/api/patient-support/chats/:id/typing",f.patient("patient-b",{params:{id},body:{...marker,cycle:2}}))).code,404);
+});
+
+test("verified account initials and clinic branding are snapshots; only the connected assistant can change future identity", async () => {
+ const f=fixture(),opened=(await f.openGuest()).body,{id}=opened;await requestGuest(f,opened);
+ f.root.staff={"staff-a":{fullName:"Fredilito Sambal"}};
+ const first=await connect(f,id,"account");assert.equal(first.body.conversation.connectedName,"Fredilito");assert.equal(first.body.conversation.connectedInitials,"FS");assert.equal(first.body.conversation.connectedAvatar,"initials");assert.equal(first.body.conversation.connectedIdentity,"account");
+ const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Account reply",clientId:"a".repeat(32)}));
+ assert.equal(reply.body.message.name,"Fredilito");assert.equal(reply.body.message.initials,"FS");
+ assert.equal((await connect(f,id,"clinic","staff-b")).code,409);
+ const changed=await connect(f,id,"clinic");assert.equal(changed.body.conversation.connectedName,"Alphastar Staff");assert.equal(changed.body.conversation.connectedAvatar,"clinic");assert.equal(changed.body.conversation.connectedInitials,"");
+ assert.equal(changed.body.conversation.messages.filter(m=>m.text.includes("has connected")).length,1);
+ assert.equal(changed.body.conversation.messages.find(m=>m.id===reply.body.message.id).name,"Fredilito");
+ const branded=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Clinic reply",clientId:"b".repeat(32)}));assert.equal(branded.body.message.avatar,"clinic");assert.equal(branded.body.message.name,"Alphastar Staff");
+ const patient=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,opened.token))).body.conversation;
+ assert.doesNotMatch(JSON.stringify(patient),/Fredilito Sambal|staff-a|connectedIdentity|_typing/);
+});

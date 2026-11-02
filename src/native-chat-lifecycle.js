@@ -6,14 +6,27 @@ const fail = (status, message) => { throw Object.assign(Error(message), { status
 const WELCOME = "Hello! 👋 Welcome to AlphaStar Clinic Support. Would you like to connect with a support assistant for help with your appointment, clinic services, account, or another concern?";
 const ACK = "Thank you! 😊 We’ve received your request. Please wait while an AlphaStar Clinic support assistant reviews your message. We’ll respond as soon as possible. During busy periods, replies may take 24 hours or longer.";
 const LEASE_MS = 90000;
+const TYPING_MS = 8000;
+const initials = name => String(name || "").trim().split(/\s+/u).filter(Boolean).filter(part => !part.includes("@")).map((part, index, parts) => index === 0 || index === parts.length - 1 ? Array.from(part)[0] : "").join("").toLocaleUpperCase().slice(0, 4) || "?";
 const publicKeys = ["id", "provider", "visitorName", "visitorEmail", "source", "status", "createdAt", "updatedAt", "lastMessage", "requestedAt", "connectedAt", "endedAt", "connectedName", "connectedRole", "cycle", "visitorSequence"];
-function publicSummary(row, actor) {
+function publicSummary(row, actor, now = Date.now()) {
   const result = Object.fromEntries(publicKeys.filter(key => row[key] !== undefined).map(key => [key, row[key]]));
+  result.visitorInitials = initials(row.visitorName);
+  result.connectedAvatar = row._connection?.avatar || "clinic";
+  result.connectedInitials = row._connection?.initials || "";
+  result.typing = {};
+  for (const sender of ["visitor", "staff"]) {
+    const marker = row._typing?.[sender];
+    if (["waiting", "connected"].includes(row.status) && marker?.cycle === row.cycle && marker.until > now && (sender !== "staff" || row.status === "connected" && marker.uid === row._connection?.uid)) {
+      result.typing[sender] = { expiresAt: marker.until };
+    }
+  }
   if (actor) {
     result.canConnect = row.status === "waiting";
     result.canReply = row.status === "connected" && row._connection?.uid === actor.uid;
     result.canEnd = ["waiting", "connected"].includes(row.status) && (actor.role === "admin" || row._connection?.uid === actor.uid);
     result.unread = (row.visitorSequence || 0) > (row._readBy?.[actor.uid] || 0);
+    if (result.canReply) result.connectedIdentity = row._connection.identity === "first_name" ? "account" : row._connection.identity === "anonymous" ? "clinic" : row._connection.identity;
     if (row._feedback?.[row.cycle]) result.feedback = row._feedback[row.cycle];
   }
   return result;
@@ -26,7 +39,7 @@ function createChatLifecycle(now = () => Date.now()) {
     return row.updatedAt;
   }
   function notice(row, message, staff) {
-    return { id: `native_chat_${row.id}_${message.id}`, userId: staff ? "desktop-staff" : row._patientUid,
+    return { id: staff ? `native_chat_${row.id}` : `native_chat_${row.id}_${message.id}`, userId: staff ? "desktop-staff" : row._patientUid,
       ...(staff ? { targetRole: "staff", targetRoles: ["admin", "staff"] } : {}),
       type: "human_chat", title: staff ? "Human chat request" : "Clinic support update",
       message: staff ? "Open Human Chat to read the new support message." : "Open Chat with Us to read your support message.",
@@ -36,6 +49,7 @@ function createChatLifecycle(now = () => Date.now()) {
   function enqueue(row, key, sender, text, identity = {}, notify) {
     const id = hash(`${row.id}:${row.cycle}:${key}`), time = stamp(row);
     const message = { id, sender, name: sender === "system" ? "System" : sender === "visitor" ? row.visitorName : identity.name,
+      ...(sender !== "system" ? { avatar: sender === "visitor" ? "initials" : identity.avatar || "clinic", initials: sender === "visitor" ? initials(row.visitorName) : identity.initials || "" } : {}),
       ...(identity.role ? { staffRole: identity.role } : {}), text, time, cycle: row.cycle };
     row._outbox ||= {};
     row._outbox[id] = { message, ...(notify === "staff" || notify === "patient" && row._patientUid ? { notice: notice(row, message, notify === "staff") } : {}) };
@@ -43,6 +57,7 @@ function createChatLifecycle(now = () => Date.now()) {
     return message;
   }
   function end(row, reason) {
+    delete row._typing;
     row.status = "ended";
     row.endedAt = stamp(row);
     enqueue(row, "ended", "system", reason === "exit" ? "The visitor left. This conversation has ended." : "This conversation has ended.");
@@ -106,7 +121,7 @@ function createChatLifecycle(now = () => Date.now()) {
       if (row.status === "ended") {
         if (!patient) fail(409, "This conversation has ended. Open a new chat.");
         row.cycle++; row.status = "welcome";
-        delete row._connection; delete row.connectedAt; delete row.connectedName; delete row.connectedRole; delete row.endedAt;
+        delete row._connection; delete row._typing; delete row.connectedAt; delete row.connectedName; delete row.connectedRole; delete row.endedAt;
       }
       if (row.status !== "welcome") return;
       row.status = "waiting"; row.requestedAt = stamp(row);
@@ -117,14 +132,17 @@ function createChatLifecycle(now = () => Date.now()) {
       enqueue(row, "acknowledgement", "system", ACK);
     });
   }
-  async function connect(db, id, actor, body, firstName) {
-    if (!["anonymous", "first_name"].includes(body?.identity)) fail(400, "Choose Anonymous or First name.");
+  async function connect(db, id, actor, body, savedName) {
+    if (!["anonymous", "first_name", "account", "clinic"].includes(body?.identity)) fail(400, "Choose Your account or Alphastar Staff.");
     return change(db, id, row => {
       cycle(row, body);
-      if (row.status === "connected" && row._connection?.uid === actor.uid) return;
-      if (row.status !== "waiting") fail(409, "This chat is no longer waiting for a connection.");
-      const name = body.identity === "anonymous" ? "Support assistant" : firstName;
-      row._connection = { uid: actor.uid, identity: body.identity, name, role: actor.role === "admin" ? "admin" : "staff" };
+      const changingIdentity = row.status === "connected" && row._connection?.uid === actor.uid;
+      if (!changingIdentity && row.status !== "waiting") fail(409, "This chat is no longer waiting for a connection.");
+      if (changingIdentity && row._connection.identity === body.identity) return;
+      const account = ["account", "first_name"].includes(body.identity);
+      const name = account ? String(savedName || "Support assistant").trim().split(/\s+/u)[0] : body.identity === "anonymous" ? "Support assistant" : "Alphastar Staff";
+      row._connection = { uid: actor.uid, identity: body.identity, name, avatar: account ? "initials" : "clinic", initials: account ? initials(savedName) : "", role: actor.role === "admin" ? "admin" : "staff" };
+      if (changingIdentity) { row.connectedName = name; row.connectedRole = row._connection.role; stamp(row); return; }
       row.status = "connected"; row.connectedName = name; row.connectedRole = row._connection.role; row.connectedAt = stamp(row);
       enqueue(row, "connected", "system", `${name} has connected to help you.`, {}, "patient");
     });
@@ -142,6 +160,7 @@ function createChatLifecycle(now = () => Date.now()) {
         if (row.status !== "connected" || row._connection?.uid !== actor.key) fail(403, "Connect to this chat before replying.");
       } else if (!["waiting", "connected"].includes(row.status)) fail(409, "Request support before sending a message.");
       if (actor.sender === "visitor") row.visitorSequence++;
+      if (row._typing?.[actor.sender]) row._typing[actor.sender].until = 0;
       const identity = actor.sender === "staff" ? row._connection : {};
       const message = enqueue(row, messageId, actor.sender, body.text, identity, actor.sender === "staff" ? "patient" : "staff");
       row._accepted ||= {}; row._accepted[messageId] = { id: message.id, cycle: row.cycle, fingerprint };
@@ -178,6 +197,18 @@ function createChatLifecycle(now = () => Date.now()) {
       row._readBy[actor.uid] = Math.max(row._readBy[actor.uid] || 0, Math.min(sequence, row.visitorSequence || 0));
     });
   }
-  return { prepare, request, connect, send, finish, heartbeat, markRead, publicSummary };
+  async function typing(db, id, actor, body) {
+    if (typeof body?.isTyping !== "boolean" || !/^[a-f0-9-]{20,80}$/i.test(body.clientId || "") || !Number.isSafeInteger(body.sequence) || body.sequence < 1) fail(400, "Invalid typing indicator.");
+    return change(db, id, row => {
+      cycle(row, body);
+      if (actor.sender === "staff" && (row.status !== "connected" || row._connection?.uid !== actor.key)) fail(403, "Connect to this chat before replying.");
+      if (!["waiting", "connected"].includes(row.status)) fail(409, "This conversation is not active.");
+      row._typing ||= {};
+      const previous = row._typing[actor.sender];
+      if (previous?.clientId === body.clientId && previous.sequence >= body.sequence || !body.isTyping && previous?.clientId && previous.clientId !== body.clientId) return;
+      row._typing[actor.sender] = { cycle: row.cycle, clientId: body.clientId, sequence: body.sequence, until: body.isTyping ? now() + TYPING_MS : 0, ...(actor.sender === "staff" ? { uid: actor.key } : {}) };
+    });
+  }
+  return { prepare, request, connect, send, finish, heartbeat, markRead, typing, publicSummary };
 }
-module.exports = { createChatLifecycle, publicSummary, LEASE_MS };
+module.exports = { createChatLifecycle, publicSummary, LEASE_MS, TYPING_MS };

@@ -10,7 +10,7 @@ const problem = (status, message) => Object.assign(Error(message), { status });
 const validId = value => /^[a-f0-9]{64}$/.test(value || "");
 const noSecrets = value => value.replace(/\b(password|pin|otp|verification code|authenticator code|setup key|recovery code|access token)\s*(?:is\b|:|=)\s*\S+/gi, "$1: [removed]").replace(/otpauth:\/\/\S+/gi, "[removed]");
 
-async function readNativeChat(db, id, before = "", actor) {
+async function readNativeChat(db, id, before = "", actor, at = Date.now()) {
   const summary = (await db.ref(`humanChats/${id}`).get()).val();
   if (!summary || summary.provider !== "alphastar") throw problem(404, "Conversation not found.");
   let query = db.ref(`nativeChatMessages/${id}`).orderByChild("time");
@@ -21,7 +21,7 @@ async function readNativeChat(db, id, before = "", actor) {
   }
   const rows = Object.values((await query.limitToLast(101).get()).val() || {}).sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
   const messages = rows.slice(-100), first = messages[0];
-  return { ...publicSummary(summary, actor), messages, before: rows.length > 100 ? `${first.time}|${first.id}` : "" };
+  return { ...publicSummary(summary, actor, at), messages, before: rows.length > 100 ? `${first.time}|${first.id}` : "" };
 }
 
 function registerNativeChatRoutes(app, options) {
@@ -33,7 +33,7 @@ function registerNativeChatRoutes(app, options) {
   const lifecycle = createChatLifecycle(now);
   async function conversation(db, id, before, actor) {
     await lifecycle.prepare(db, id);
-    return readNativeChat(db, id, before, actor);
+    return readNativeChat(db, id, before, actor, now());
   }
   const database = () => { const instance = options.getFirebaseApp(); if (!instance) throw problem(503, "Staff chat is temporarily unavailable."); return getDatabase(instance); };
   const route = handler => async (req, res) => {
@@ -144,6 +144,12 @@ function registerNativeChatRoutes(app, options) {
       const message = await send(db, id, { key: kind === "patient" ? record.uid : id, sender: "visitor", name: "", }, req.body);
       return res.json({ ok: true, message });
     }));
+    app.post(prefix + "/:id/typing", route(async (req, res) => {
+      const db = database(), record = await access(req, db, kind), id = req.params.id;
+      rate(`typing:visitor:${id}`, 90);
+      await lifecycle.typing(db, id, { key: kind === "patient" ? record.uid : id, sender: "visitor" }, req.body);
+      return res.json({ ok: true });
+    }));
   }
   app.post("/api/support/chats/:id/heartbeat", route(async (req, res) => {
     const db = database(); await access(req, db, "guest");
@@ -166,14 +172,20 @@ function registerNativeChatRoutes(app, options) {
     const actor = staff(req), id = checkId(req), db = database();
     const [staffSnapshot, userSnapshot] = await Promise.all([db.ref(`staff/${actor.uid}`).get(), db.ref(`users/${actor.uid}`).get()]);
     const profile = staffSnapshot.val() || {}, user = userSnapshot.val() || {};
-    const name = [profile.firstName, user.firstName, profile.name, profile.fullName, profile.displayName, user.name, user.fullName, user.displayName]
-      .map(value => clean(value, 120).replace(/[<>]/g, "").replace(/\s+/g, " ").trim()).find(value => value && !value.includes("@"))?.split(" ")[0] || "Support assistant";
+    const name = [profile.fullName, profile.name, profile.displayName, [profile.firstName, profile.lastName].filter(Boolean).join(" "), user.fullName, user.name, user.displayName, [user.firstName, user.lastName].filter(Boolean).join(" ")]
+      .map(value => clean(value, 120).replace(/[<>]/g, "").replace(/\s+/g, " ").trim()).find(value => value && !value.includes("@")) || "Support assistant";
     await lifecycle.connect(db, id, actor, req.body, name);
     return res.json({ ok: true, conversation: await conversation(db, id, "", actor) });
   }));
   app.post("/api/staff/human-chats/:id/read", route(async (req, res) => {
     const actor = staff(req), id = checkId(req), db = database();
     await lifecycle.markRead(db, id, actor, req.body?.sequence);
+    return res.json({ ok: true });
+  }));
+  app.post("/api/staff/human-chats/:id/typing", route(async (req, res) => {
+    const actor = staff(req), id = checkId(req), db = database();
+    rate(`typing:staff:${actor.uid}`, 90);
+    await lifecycle.typing(db, id, { key: actor.uid, sender: "staff" }, req.body);
     return res.json({ ok: true });
   }));
   app.post("/api/staff/human-chats/:id/end", route(async (req, res) => {
@@ -186,6 +198,6 @@ function registerNativeChatRoutes(app, options) {
     const message = await send(db, id, { key: actor.uid, sender: "staff", role: actor.role }, req.body);
     return res.json({ ok: true, message });
   }));
-  return { conversation, summary: async (db, row, actor) => row.provider === "alphastar" ? publicSummary(await lifecycle.prepare(db, row.id, row), actor) : row };
+  return { conversation, summary: async (db, row, actor) => row.provider === "alphastar" ? publicSummary(await lifecycle.prepare(db, row.id, row), actor, now()) : row };
 }
 module.exports = { registerNativeChatRoutes, readNativeChat };
