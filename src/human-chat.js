@@ -105,6 +105,24 @@ function registerHumanChatRoutes(app, options) {
     try { return await handler(req, res); } catch (cause) { return failure(res, cause); }
   };
   const native = registerNativeChatRoutes(app, options);
+  app.get("/api/staff/human-chats/unread", staffRoute(async (req, res) => {
+    if (!["admin", "staff"].includes(req.staffAccess.actor.role)) return res.status(403).json({ ok: false, error: "Clinic staff access required." });
+    const db = database(), unread = [], at = options.now?.() ?? Date.now();
+    let cursor;
+    do {
+      let query = db.ref("humanChats").orderByChild("updatedAt");
+      if (cursor) query = query.endBefore(cursor.time, cursor.id);
+      const rows = Object.values((await query.limitToLast(100).get()).val() || {}).sort((a, b) => String(a.updatedAt || "").localeCompare(String(b.updatedAt || "")) || a.id.localeCompare(b.id));
+      for (const row of rows) {
+        const sequence = row.visitorSequence || (row.lastMessage ? 1 : 0);
+        if (row.provider !== "alphastar" || !(row.requestedAt || row.lastMessage) || sequence <= (row._readBy?.[req.staffAccess.actor.uid] || 0)) continue;
+        const history = row.status === "ended" || row.source === "website" && Number.isFinite(row._guestLeaseUntil) && row._guestLeaseUntil <= at;
+        unread.push({ id: row.id, sequence, history });
+      }
+      cursor = rows.length === 100 && rows[0].updatedAt ? { time: rows[0].updatedAt, id: rows[0].id } : null;
+    } while (cursor);
+    return res.json({ ok: true, unread });
+  }));
   app.get("/api/staff/human-chats", staffRoute(async (req, res) => {
     let query = database().ref("humanChats").orderByChild("updatedAt");
     if (req.query?.before) {

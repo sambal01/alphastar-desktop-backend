@@ -304,3 +304,18 @@ test("verified account initials and clinic branding are snapshots; only the conn
  const patient=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,opened.token))).body.conversation;
  assert.doesNotMatch(JSON.stringify(patient),/Fredilito Sambal|staff-a|connectedIdentity|_typing/);
 });
+
+test("the staff navigation unread index covers older history with bounded queries and never exposes visitor details", async()=>{
+ const f=fixture();f.root.humanChats={};
+ for(let i=0;i<205;i++){
+  const id=i.toString(16).padStart(64,"0"),at=new Date(Date.parse("2026-11-01T00:00:00Z")+i*1000).toISOString();
+  f.root.humanChats[id]={id,provider:"alphastar",lifecycleVersion:2,status:i%2?"ended":"connected",source:i===0?"website":"mobile",_guestLeaseUntil:0,cycle:1,visitorName:"Private Synthetic Person",visitorEmail:"private@example.test",visitorSequence:1,requestedAt:at,updatedAt:at,_readBy:{"staff-a":i>=200?1:0},_connection:{uid:"private-assistant"}};
+ }
+ const response=await f.invoke("GET","/api/staff/human-chats/unread",staff("", "staff-a"));assert.equal(response.code,200);assert.equal(response.body.unread.length,200);
+ assert.equal(response.body.unread.filter(row=>row.history).length,101);
+ assert.doesNotMatch(JSON.stringify(response.body),/Private Synthetic|private@example|private-assistant|_readBy|_connection/);
+ assert.ok(f.queries.every(query=>query.limit===100&&query.order==="updatedAt"));assert.equal(f.queries.length,3);
+ assert.equal((await f.invoke("GET","/api/staff/human-chats/unread",staff("", "staff-b"))).body.unread.length,205);
+ assert.equal((await f.invoke("GET","/api/staff/human-chats/unread",staff("", "patient-a",{},"patient"))).code,403);
+ assert.equal((await f.invoke("GET","/api/staff/human-chats/unread")).code,403);
+});
