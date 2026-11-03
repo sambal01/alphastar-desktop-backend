@@ -3,6 +3,7 @@
 // Kept identical in the desktop and mobile backends. Firebase is canonical.
 const { transactionWithLiveSnapshot } = require("./realtime-transaction");
 const { buildPatientAudit } = require("./patient-audit");
+const { TYPES, examinationType, validateExaminationType } = require("./examination-types");
 const STAFF_ROLES = new Set(["admin", "staff", "doctor", "nurse", "receptionist"]);
 const FINISHED = new Set(["approved", "completed", "reviewed", "rejected"]);
 const SECTIONS = ["personalBackground", "medicalHistory", "medicalHistoryDetails", "physicalAssessment"];
@@ -28,7 +29,7 @@ function submittedAt(record) {
   return String(record?.submittedAt || record?.recordedAt || record?.createdAt || "");
 }
 function isSmpe(record) {
-  return record?.patientSubmitted === true && record.recordType === "patient_medical_record" && !record.deleted && !record.deletedAt;
+  return record?.patientSubmitted === true && record.recordType === "patient_medical_record" && Boolean(examinationType(record)) && !record.deleted && !record.deletedAt;
 }
 function values(history) {
   return Array.isArray(history) ? history.filter(Boolean) : Object.values(history || {});
@@ -42,6 +43,7 @@ function snapshot(record) {
     if (record[key] !== undefined) copy[key] = record[key];
   }
   for (const key of SECTIONS) copy[key] = JSON.parse(JSON.stringify(record[key] || {}));
+  copy.examinationType = examinationType(record);
   copy.revision = revision(record);
   copy.submittedAt = submittedAt(record);
   return copy;
@@ -60,7 +62,7 @@ function savedActor(root, actor, patient = false) {
   return { uid: actor.uid, role, name: String(user.name || user.fullName || user.displayName || staff?.name || staff?.fullName || "Clinic staff").slice(0, 160) };
 }
 function notice(key, uid, recordKey, record, now, title, message, type) {
-  return { id: key, userId: uid, referenceId: recordKey, referenceType: "medicalRecords", revision: revision(record),
+  return { id: key, userId: uid, referenceId: recordKey, referenceType: "medicalRecords", examinationType: examinationType(record), revision: revision(record),
     createdAt: now, updatedAt: now, timestamp: now, source: "mobile", title, message, type, read: false, isRead: false };
 }
 function keepCompleted(history, record) {
@@ -96,7 +98,7 @@ function updateSmpe(root, recordKey, input, actor, now) {
   recordKey = safeKey(recordKey);
   const editor = savedActor(root, actor);
   const record = root.medicalRecords?.[recordKey];
-  if (!isSmpe(record) || !record.userId) throw new SmpeError("This patient SMPE form is no longer available.", 404, "SMPE_NOT_FOUND");
+  if (!isSmpe(record) || !record.userId) throw new SmpeError("This patient medical form is no longer available.", 404, "SMPE_NOT_FOUND");
   if (!Number.isSafeInteger(input?.expectedRevision) || input.expectedRevision < 1 || typeof input?.expectedSubmittedAt !== "string") throw new SmpeError("Open the current form before editing it.");
   if (revision(record) !== input.expectedRevision || submittedAt(record) !== input.expectedSubmittedAt) throw new SmpeError("This form has changed. Open the latest version before saving corrections.", 409, "SMPE_STALE");
   if (finished(record)) throw new SmpeError("Completed reviews are read-only. Do not overwrite a reviewed version.", 409, "SMPE_COMPLETED");
@@ -113,8 +115,9 @@ function updateSmpe(root, recordKey, input, actor, now) {
   for (const field of ["staffRemarks", "reviewedAt", "reviewedBy", "reviewerName"]) delete next[field];
   root.medicalRecords[recordKey] = next;
   const noticeId = "smpe-edit-" + recordKey + "-r" + next.revision;
-  const notification = notice(noticeId, record.userId, recordKey, next, timestamp, "SMPE record updated",
-    "The clinic updated your Student Medical & Physical Examination record. Open your record to review the changes.", "medical_record_updated");
+  const form = TYPES[examinationType(record)];
+  const notification = notice(noticeId, record.userId, recordKey, next, timestamp, form.label + " record updated",
+    "The clinic updated your " + form.title + " record. Open your record to review the changes.", "medical_record_updated");
   notification.source = "desktop";
   (root.notifications ||= {})[noticeId] = notification;
   (root.auditLogs ||= {})[noticeId] = { id: noticeId, action: "smpe_updated", actorId: editor.uid, actorRole: editor.role,
@@ -125,7 +128,7 @@ function approveSmpe(root, recordKey, input, actor, now) {
   recordKey = safeKey(recordKey);
   const reviewer = savedActor(root, actor);
   const record = root.medicalRecords?.[recordKey];
-  if (!isSmpe(record) || !record.userId) throw new SmpeError("This patient SMPE form is no longer available.", 404, "SMPE_NOT_FOUND");
+  if (!isSmpe(record) || !record.userId) throw new SmpeError("This patient medical form is no longer available.", 404, "SMPE_NOT_FOUND");
   if (!Number.isSafeInteger(input?.expectedRevision) || typeof input?.expectedSubmittedAt !== "string") {
     throw new SmpeError("Open the patient's form before approving it.");
   }
@@ -146,8 +149,9 @@ function approveSmpe(root, recordKey, input, actor, now) {
   root.medicalRecords[recordKey] = next;
   root.notifications ||= {};
   const noticeId = "smpe-review-" + recordKey + "-r" + revision(record);
-  const notification = notice(noticeId, record.userId, recordKey, record, timestamp, "SMPE approved",
-    "Your Student Medical & Physical Examination form has been reviewed and approved by the clinic.", "medical_record_approved");
+  const form = TYPES[examinationType(record)];
+  const notification = notice(noticeId, record.userId, recordKey, record, timestamp, form.label + " approved",
+    "Your " + form.title + " form has been reviewed and approved by the clinic.", "medical_record_approved");
   notification.source = "desktop";
   root.notifications[noticeId] = notification;
   root.auditLogs ||= {};
@@ -160,6 +164,8 @@ function approveSmpe(root, recordKey, input, actor, now) {
 // Read/build inside the transaction so approval and resubmission cannot erase
 // each other's completed history, answers, or revision counter.
 function submitSmpe(root, payload, actor, ids, now) {
+  const type = validateExaminationType(payload.examinationType);
+  const form = TYPES[type];
   const patient = savedActor(root, actor, true);
   const key = safeKey(ids.recordKey);
   const existing = root.medicalRecords?.[key];
@@ -167,13 +173,14 @@ function submitSmpe(root, payload, actor, ids, now) {
     throw new SmpeError("This medical record is not available for editing.", 403, "MEDICAL_RECORD_FORBIDDEN");
   }
   if (!ids.editing && existing) throw new SmpeError("Please submit the form again.", 409, "SMPE_CONFLICT");
+  if (existing && examinationType(existing) !== type) throw new SmpeError("A saved form cannot be changed to a different examination type.", 409, "EXAMINATION_TYPE_MISMATCH");
   const timestamp = new Date(now).toISOString();
   const reviewHistory = values(existing?.reviewHistory);
   if (existing) keepCompleted(reviewHistory, existing);
   const revisionHistory = values(existing?.revisionHistory);
   if (existing) revisionHistory.push(snapshot(existing));
   const record = { ...(existing || {}), id: key, userId: actor.uid, medicalRecordId: existing?.medicalRecordId || ids.medicalRecordId,
-    title: "Student Medical & Physical Examination", recordType: "patient_medical_record", patientSubmitted: true, source: "mobile",
+    title: form.title, examinationType: type, recordType: "patient_medical_record", patientSubmitted: true, source: "mobile",
     status: "Pending Review", revision: existing ? revision(existing) + 1 : 1, createdAt: existing?.createdAt || timestamp,
     updatedAt: timestamp, submittedAt: timestamp, recordedAt: timestamp };
   for (const field of SECTIONS) record[field] = JSON.parse(JSON.stringify(payload[field] || {}));
@@ -186,10 +193,10 @@ function submitSmpe(root, payload, actor, ids, now) {
   const baseId = "smpe-" + key + "-r" + record.revision;
   const notification = notice(baseId + "-patient", actor.uid, key, record, timestamp,
     existing ? "Medical record updated" : "Medical record submitted",
-    "Your Student Medical & Physical Examination was submitted for review.", existing ? "medical_record_updated" : "medical_record_submitted");
+    "Your " + form.title + " was submitted for review.", existing ? "medical_record_updated" : "medical_record_submitted");
   const patientName = [record.personalBackground.firstName, record.personalBackground.lastName].filter(Boolean).join(" ") || "A patient";
-  const staffNotification = notice(baseId, "desktop-staff", key, record, timestamp, existing ? "SMPE updated" : "New SMPE submission",
-    patientName + (existing ? " updated an SMPE form." : " submitted an SMPE form.") + " Open SMPE Approval to review it.", existing ? "smpe_updated" : "smpe_submitted");
+  const staffNotification = notice(baseId, "desktop-staff", key, record, timestamp, existing ? form.label + " updated" : "New " + form.label + " submission",
+    patientName + (existing ? " updated a " : " submitted a ") + form.label + " form. Open " + form.label + " Approval to review it.", existing ? "smpe_updated" : "smpe_submitted");
   root.notifications[notification.id] = notification;
   root.notifications[staffNotification.id] = staffNotification;
   const audit = buildPatientAudit({ uid: actor.uid, email: root.users[actor.uid].email || actor.email,
@@ -221,7 +228,7 @@ function registerSmpeRoutes(app, options = {}) {
       res.json({ ok: true, ...result });
     } catch (error) {
       res.status(error instanceof SmpeError ? error.status : 503).json({ ok: false, code: error instanceof SmpeError ? error.code : "SMPE_UNAVAILABLE",
-        error: error instanceof SmpeError ? error.message : "SMPE updates are temporarily unavailable. Please try again." });
+        error: error instanceof SmpeError ? error.message : "Medical form updates are temporarily unavailable. Please try again." });
     }
   });
   app.patch("/api/staff/medical-records/:recordId/review", async (req, res) => {
@@ -236,7 +243,7 @@ function registerSmpeRoutes(app, options = {}) {
     } catch (error) {
       res.status(error instanceof SmpeError ? error.status : 503).json({ ok: false,
         code: error instanceof SmpeError ? error.code : "SMPE_UNAVAILABLE",
-        error: error instanceof SmpeError ? error.message : "SMPE review is temporarily unavailable. Please try again." });
+        error: error instanceof SmpeError ? error.message : "Medical form review is temporarily unavailable. Please try again." });
     }
   });
 }
