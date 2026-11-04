@@ -32,7 +32,8 @@ test("approval, clinic corrections and resubmission preserve MAPE type, full his
  const approved=approveSmpe(db,"mape",expected(edited.record),{uid:"staff"},now+2000);
  assert.equal(approved.record.status,"Approved");assert.equal(approved.record.reviewHistory[0].examinationType,"mape");
  assert.equal(approved.notification.title,"MAPE approved");assert.equal(approved.notification.userId,"patient");
- const revised=submitSmpe(db,payload("mape"),{uid:"patient"},{recordKey:"mape",editing:true},now+3000);
+ assert.throws(()=>submitSmpe(db,payload("mape"),{uid:"patient"},{recordKey:"mape",editing:true},now+3000),error=>error.code==="SMPE_VITALS_LOCKED");
+ const revised=submitSmpe(db,{...payload("mape"),physicalAssessment:approved.record.physicalAssessment},{uid:"patient"},{recordKey:"mape",editing:true},now+3000);
  assert.equal(revised.record.status,"Pending Review");assert.equal(revised.record.reviewHistory.length,1);
  assert.equal(revised.record.reviewHistory[0].personalBackground.companyOccupation,"Synthetic company");
  assert.equal(revised.record.reviewHistory[0].physicalAssessment.height,"171");

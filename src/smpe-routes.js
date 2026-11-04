@@ -101,18 +101,24 @@ function updateSmpe(root, recordKey, input, actor, now) {
   if (!isSmpe(record) || !record.userId) throw new SmpeError("This patient medical form is no longer available.", 404, "SMPE_NOT_FOUND");
   if (!Number.isSafeInteger(input?.expectedRevision) || input.expectedRevision < 1 || typeof input?.expectedSubmittedAt !== "string") throw new SmpeError("Open the current form before editing it.");
   if (revision(record) !== input.expectedRevision || submittedAt(record) !== input.expectedSubmittedAt) throw new SmpeError("This form has changed. Open the latest version before saving corrections.", 409, "SMPE_STALE");
-  if (finished(record)) throw new SmpeError("Completed reviews are read-only. Do not overwrite a reviewed version.", 409, "SMPE_COMPLETED");
+  if (!["admin", "staff"].includes(editor.role)) throw new SmpeError("Only admin and staff can correct saved vital signs.", 403, "SMPE_FORBIDDEN");
   const { patch, reason } = correctionPatch(record, input);
   const changedFields = Object.entries(patch).flatMap(([section, fields]) => Object.keys(fields).map(key => section + "." + key));
   if (!changedFields.length) return { record: { ...record, recordKey }, unchanged: true };
   if (revision(record) >= Number.MAX_SAFE_INTEGER) throw new SmpeError("The form revision cannot be updated.", 409, "SMPE_STALE");
   const timestamp = new Date(now).toISOString();
-  const next = { ...record, status: "Pending Review", revision: revision(record) + 1, updatedAt: timestamp,
+  const reviewed = finished(record);
+  const next = { ...record, status: reviewed ? record.status : "Pending Review", revision: revision(record) + 1, updatedAt: timestamp,
     lastEditedAt: timestamp, lastEditedBy: editor.uid, lastEditorName: editor.name,
     revisionHistory: [...values(record.revisionHistory), snapshot(record)] };
   if (reason) next.lastEditReason = reason; else delete next.lastEditReason;
   for (const [section, fields] of Object.entries(patch)) next[section] = { ...(record[section] || {}), ...fields };
-  for (const field of ["staffRemarks", "reviewedAt", "reviewedBy", "reviewerName"]) delete next[field];
+  if (reviewed) {
+    const history = values(record.reviewHistory);
+    keepCompleted(history, record);
+    keepCompleted(history, next);
+    next.reviewHistory = history;
+  } else for (const field of ["staffRemarks", "reviewedAt", "reviewedBy", "reviewerName"]) delete next[field];
   root.medicalRecords[recordKey] = next;
   const noticeId = "smpe-edit-" + recordKey + "-r" + next.revision;
   const form = TYPES[examinationType(record)];
@@ -174,6 +180,10 @@ function submitSmpe(root, payload, actor, ids, now) {
   }
   if (!ids.editing && existing) throw new SmpeError("Please submit the form again.", 409, "SMPE_CONFLICT");
   if (existing && examinationType(existing) !== type) throw new SmpeError("A saved form cannot be changed to a different examination type.", 409, "EXAMINATION_TYPE_MISMATCH");
+  if (existing && PHYSICAL_FIELDS.filter(field => field !== "remarks").some(field =>
+    String(payload.physicalAssessment?.[field] ?? "").trim() !== String(existing.physicalAssessment?.[field] ?? "").trim())) {
+    throw new SmpeError("Saved vital signs can only be updated by clinic staff. Reopen the latest form before submitting.", 409, "SMPE_VITALS_LOCKED");
+  }
   const timestamp = new Date(now).toISOString();
   const reviewHistory = values(existing?.reviewHistory);
   if (existing) keepCompleted(reviewHistory, existing);

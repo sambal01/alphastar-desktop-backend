@@ -120,11 +120,11 @@ test('concurrent edits keep one new revision and reject the stale second update'
   assert.equal(f.read().medicalRecords.test_record.revision, 2); assert.equal(f.read().medicalRecords.test_record.revisionHistory.length, 1);
   assert.equal(f.read().medicalRecords.test_record.physicalAssessment.height, '160'); assert.equal(f.count(), 0);
 });
-test('completed history and stale timestamps are read-only; edits never silently approve a form', async () => {
+test('completed history corrections preserve approval and original versions; stale timestamps cannot overwrite them', async () => {
   const root = seed(), expected = input(root);
   smpe.approveSmpe(root, 'test_record', { ...expected, remarks: 'Fictional review' }, { uid: 'reviewer' }, NOW + 1000);
   const f = fixture(root), before = f.read(), completed = await f.request(expected);
-  assert.equal(completed.status, 409); assert.equal(completed.body.code, 'SMPE_COMPLETED'); assert.deepEqual(f.read(), before);
+  assert.equal(completed.status, 200);assert.equal(completed.body.record.status,'Approved');assert.equal(completed.body.record.reviewHistory.length,2);assert.deepEqual(completed.body.record.reviewHistory[0],before.medicalRecords.test_record.reviewHistory[0]);assert.equal(completed.body.notification.userId,'patient');assert.equal(completed.body.record.revision,2);assert.equal(completed.body.record.reviewedBy,'reviewer');
   const staleRoot = seed(); staleRoot.medicalRecords.test_record.submittedAt = new Date(NOW + 2000).toISOString();
   assert.equal((await fixture(staleRoot).request(expected)).body.code, 'SMPE_STALE');
   const editRoot = seed(); smpe.updateSmpe(editRoot, 'test_record', input(editRoot), { uid: 'reviewer' }, NOW + 1000);
@@ -133,7 +133,8 @@ test('completed history and stale timestamps are read-only; edits never silently
 });
 test('later patient resubmissions keep the clinic correction snapshot without impersonating its editor', () => {
   const root = seed(); smpe.updateSmpe(root, 'test_record', input(root), { uid: 'reviewer' }, NOW + 1000);
-  submitSmpe(root, payload, { uid: 'patient' }, { recordKey: 'test_record', editing: true }, NOW + 2000);
+  assert.throws(()=>submitSmpe(root,payload,{uid:'patient'},{recordKey:'test_record',editing:true},NOW+2000),error=>error.code==='SMPE_VITALS_LOCKED');
+  submitSmpe(root, {...payload,physicalAssessment:{...root.medicalRecords.test_record.physicalAssessment}}, { uid: 'patient' }, { recordKey: 'test_record', editing: true }, NOW + 2000);
   const record = root.medicalRecords.test_record;
   assert.equal(record.revision, 3); assert.equal(record.lastEditedBy, undefined);
   assert.equal(record.revisionHistory.at(-1).lastEditedBy, 'reviewer');
