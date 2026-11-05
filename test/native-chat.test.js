@@ -102,7 +102,7 @@ test("messages are idempotent, new messages alone increase unread, and reads are
 
 test("end saves feedback, history is read-only, new website visits never recover someone else's thread",async()=>{
  const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id);
- assert.equal((await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,{cycle:1}))).code,400);
+ assert.equal((await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,{cycle:1,rating:"invalid"}))).code,400);
  const endBody={cycle:1,rating:"up",comment:"Synthetic helpful reply"};
  const ended=await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,endBody));assert.equal(ended.code,200);assert.equal(ended.body.conversation.status,"ended");
  assert.equal((await f.invoke("POST","/api/support/chats/:id/end",f.guest(id,token,endBody))).code,200);

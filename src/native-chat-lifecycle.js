@@ -173,13 +173,15 @@ function createChatLifecycle(now = () => Date.now()) {
       cycle(row, body);
       if (actor && row.status !== "ended" && actor.role !== "admin" && row._connection?.uid !== actor.uid) fail(403, "Only the connected assistant or an administrator can end this chat.");
       if (!actor && reason === "manual") {
-        if (!["up", "down"].includes(body.rating)) fail(400, "Select a rating before ending the conversation.");
+        const rating = body.rating == null || body.rating === "" ? null : body.rating;
+        if (rating !== null && !["up", "down"].includes(rating)) fail(400, "Choose Like or Dislike, or leave the rating blank.");
+        if (body.comment != null && typeof body.comment !== "string") fail(400, "Feedback comments must be text.");
         const comment = typeof body.comment === "string" ? body.comment.trim() : "";
         if (comment.length > 1000) fail(400, "Use up to 1,000 characters for feedback.");
         row._feedback ||= {};
         const previous = row._feedback[row.cycle];
-        if (previous && (previous.rating !== body.rating || previous.comment !== comment)) fail(409, "Feedback was already submitted.");
-        row._feedback[row.cycle] ||= { rating: body.rating, comment, time: new Date(now()).toISOString() };
+        if (previous && ((previous.rating || null) !== rating || previous.comment !== comment)) fail(409, "Feedback was already submitted.");
+        row._feedback[row.cycle] ||= { rating, comment, time: new Date(now()).toISOString() };
       }
       if (row.status !== "ended") end(row, reason);
     });
