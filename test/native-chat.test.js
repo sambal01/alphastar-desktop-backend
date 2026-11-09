@@ -140,6 +140,7 @@ test("mobile persists on exit, enforces its owner and MFA, and can continue an e
  const resumed=await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));assert.equal(resumed.code,200);assert.equal(resumed.body.conversation.cycle,2);assert.equal(resumed.body.conversation.status,"waiting");
  assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Stale reply",clientId:"b".repeat(32)}))).code,409);
  assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:2,text:"Not connected",clientId:"b".repeat(32)}))).code,403);
+ const newConnection=await f.invoke("POST","/api/staff/human-chats/:id/connect",staff(id,"staff-a",{cycle:2,identity:"account"}));assert.equal(newConnection.code,200);assert.equal(newConnection.body.conversation.connectedIdentity,"account");
  f.root.patientAuthenticator={"patient-a":{version:1,enabled:true,revision:"a".repeat(64),provider:"password"}};
  assert.equal((await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a"))).code,401);
  f.root.users["patient-b"].active=false;assert.equal((await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-b"))).code,403);
@@ -272,6 +273,21 @@ test("typing is owner-authorized, expires, does not save drafts, create notices,
  assert.equal((await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,{...marker,cycle:2}))).code,409);
 });
 
+test("renewed draft presence survives multiple leases without creating messages, notices or unread changes",async()=>{
+ const f=fixture(),opened=(await f.openGuest()).body,{id,token}=opened;await requestGuest(f,opened);await connect(f,id,"clinic");
+ const before=JSON.stringify({messages:f.root.nativeChatMessages,notices:f.root.notifications,sequence:f.root.humanChats[id].visitorSequence,updatedAt:f.root.humanChats[id].updatedAt});
+ const marker={cycle:1,isTyping:true,clientId:"f".repeat(32)};
+ for(let sequence=1;sequence<=7;sequence++){
+  f.advance(3000);assert.equal((await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,{...marker,sequence}))).code,200);
+  assert.equal((await f.invoke("POST","/api/staff/human-chats/:id/typing",staff(id,"staff-a",{...marker,sequence}))).code,200);
+  const row=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation;assert.ok(row.typing.visitor);assert.ok(row.typing.staff);
+ }
+ assert.equal(JSON.stringify({messages:f.root.nativeChatMessages,notices:f.root.notifications,sequence:f.root.humanChats[id].visitorSequence,updatedAt:f.root.humanChats[id].updatedAt}),before);
+ await f.invoke("POST","/api/support/chats/:id/typing",f.guest(id,token,{...marker,isTyping:false,sequence:8}));
+ assert.equal((await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation.typing.visitor,undefined);
+ f.advance(8001);assert.deepEqual((await f.invoke("GET","/api/support/chats/:id",f.guest(id,token))).body.conversation.typing,{});
+});
+
 test("out-of-order typing cannot resurrect a stopped indicator; send and end clear it and resumed cycles reject old markers", async () => {
  const f=fixture(),opened=await f.invoke("POST","/api/patient-support/chats/open",f.patient("patient-a")),id=opened.body.id;
  await f.invoke("POST","/api/patient-support/chats/:id/request",f.patient("patient-a",{params:{id},body:{cycle:1}}));
@@ -290,17 +306,20 @@ test("out-of-order typing cannot resurrect a stopped indicator; send and end cle
  assert.equal((await f.invoke("POST","/api/patient-support/chats/:id/typing",f.patient("patient-b",{params:{id},body:{...marker,cycle:2}}))).code,404);
 });
 
-test("verified account initials and clinic branding are snapshots; only the connected assistant can change future identity", async () => {
+test("connection identity is fixed for the cycle, retries are idempotent and account initials stay verified", async () => {
  const f=fixture(),opened=(await f.openGuest()).body,{id}=opened;await requestGuest(f,opened);
  f.root.staff={"staff-a":{fullName:"Fredilito Sambal"}};
  const first=await connect(f,id,"account");assert.equal(first.body.conversation.connectedName,"Fredilito");assert.equal(first.body.conversation.connectedInitials,"FS");assert.equal(first.body.conversation.connectedAvatar,"initials");assert.equal(first.body.conversation.connectedIdentity,"account");
  const reply=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Account reply",clientId:"a".repeat(32)}));
  assert.equal(reply.body.message.name,"Fredilito");assert.equal(reply.body.message.initials,"FS");
  assert.equal((await connect(f,id,"clinic","staff-b")).code,409);
- const changed=await connect(f,id,"clinic");assert.equal(changed.body.conversation.connectedName,"Alphastar Staff");assert.equal(changed.body.conversation.connectedAvatar,"clinic");assert.equal(changed.body.conversation.connectedInitials,"");
- assert.equal(changed.body.conversation.messages.filter(m=>m.text.includes("has connected")).length,1);
- assert.equal(changed.body.conversation.messages.find(m=>m.id===reply.body.message.id).name,"Fredilito");
- const branded=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Clinic reply",clientId:"b".repeat(32)}));assert.equal(branded.body.message.avatar,"clinic");assert.equal(branded.body.message.name,"Alphastar Staff");
+ assert.equal((await connect(f,id,"clinic")).code,409);
+ const retry=await connect(f,id,"first_name");assert.equal(retry.code,200);assert.equal(retry.body.conversation.connectedIdentity,"account");
+ assert.equal(retry.body.conversation.messages.filter(m=>m.text.includes("has connected")).length,1);
+ assert.equal(retry.body.conversation.messages.find(m=>m.id===reply.body.message.id).name,"Fredilito");
+ const next=await f.invoke("POST","/api/staff/human-chats/:id/messages",staff(id,"staff-a",{cycle:1,text:"Still account reply",clientId:"b".repeat(32)}));assert.equal(next.body.message.avatar,"initials");assert.equal(next.body.message.name,"Fredilito");
+ const clinic=(await f.openGuest()).body;await requestGuest(f,clinic);await connect(f,clinic.id,"clinic");assert.equal((await connect(f,clinic.id,"account")).code,409);
+ const branded=(await connect(f,clinic.id,"anonymous")).body.conversation;assert.equal(branded.connectedName,"Alphastar Staff");assert.equal(branded.connectedAvatar,"clinic");
  const patient=(await f.invoke("GET","/api/support/chats/:id",f.guest(id,opened.token))).body.conversation;
  assert.doesNotMatch(JSON.stringify(patient),/Fredilito Sambal|staff-a|connectedIdentity|_typing/);
 });

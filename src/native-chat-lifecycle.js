@@ -136,13 +136,15 @@ function createChatLifecycle(now = () => Date.now()) {
     if (!["anonymous", "first_name", "account", "clinic"].includes(body?.identity)) fail(400, "Choose Your account or Alphastar Staff.");
     return change(db, id, row => {
       cycle(row, body);
-      const changingIdentity = row.status === "connected" && row._connection?.uid === actor.uid;
-      if (!changingIdentity && row.status !== "waiting") fail(409, "This chat is no longer waiting for a connection.");
-      if (changingIdentity && row._connection.identity === body.identity) return;
       const account = ["account", "first_name"].includes(body.identity);
+      if (row.status === "connected" && row._connection?.uid === actor.uid) {
+        const savedAccount = ["account", "first_name"].includes(row._connection.identity);
+        if (savedAccount === account) return;
+        fail(409, "The display name is fixed for this conversation.");
+      }
+      if (row.status !== "waiting") fail(409, "This chat is no longer waiting for a connection.");
       const name = account ? String(savedName || "Support assistant").trim().split(/\s+/u)[0] : body.identity === "anonymous" ? "Support assistant" : "Alphastar Staff";
       row._connection = { uid: actor.uid, identity: body.identity, name, avatar: account ? "initials" : "clinic", initials: account ? initials(savedName) : "", role: actor.role === "admin" ? "admin" : "staff" };
-      if (changingIdentity) { row.connectedName = name; row.connectedRole = row._connection.role; stamp(row); return; }
       row.status = "connected"; row.connectedName = name; row.connectedRole = row._connection.role; row.connectedAt = stamp(row);
       enqueue(row, "connected", "system", `${name} has connected to help you.`, {}, "patient");
     });

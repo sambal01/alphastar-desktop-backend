@@ -3867,6 +3867,21 @@ app.post("/api/staff-auth/verify", async (req, res) => {
     res.json({ customToken: customToken || undefined, deviceId: req.body.deviceId || id("device"), ok: true, sessionId: id("session") });
   } catch (error) { sendError(res, error); }
 });
+app.post("/api/staff-auth/pin/check", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const account = pinAccount(req);
+    const pins = desktopPins();
+    const { configured } = await pins.status(account);
+    if (configured) await pins.verify(account, req.body.currentPin);
+    else {
+      requireFreshPinLogin(account);
+      if (req.body.currentPin) throw Object.assign(new Error("This account has no saved PIN. Reload your profile before continuing."), { status: 409 });
+    }
+    // No session, change grant, or replacement PIN is created by this check.
+    res.json({ ok: true, verified: true, configured });
+  } catch (error) { sendError(res, error); }
+});
 app.post("/api/staff-auth/pin/change", async (req, res) => {
   res.set("Cache-Control", "no-store");
   try {

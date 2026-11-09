@@ -37,7 +37,7 @@ function runtime() {
     await routes.get("/api/staff-auth/" + route)(req, res);
     return { status, result };
   }
-  return { request, calls };
+  return { request, calls, pins };
 }
 test("PIN status and correct PIN sign-in never send an email or create an OTP challenge", async () => {
   const r = runtime();
@@ -73,6 +73,30 @@ test("profile PIN change requires the current PIN and confirmation", async () =>
   assert.equal((await r.request("pin/change", { currentPin: "012345", pin: "654321", confirmPin: "654321" })).status, 200);
   assert.deepEqual(JSON.parse(JSON.stringify(r.calls.find(call => call[0] === "change").slice(1))),
     [{ uid: "canonical-admin", authProviderId: "password", authTime: r.calls.find(call => call[0] === "change")[1].authTime }, "654321", "proof"]);
+});
+
+test("profile Confirm verifies only the signed-in PIN without changing it or issuing tokens", async () => {
+  const r = runtime();
+  for (const currentPin of ["654321", "wrong", "", undefined]) {
+    const result = await r.request("pin/check", { currentPin, uid: "forged" });
+    assert.equal(result.status, 400); assert.equal(result.result.verified, undefined);
+  }
+  const result = await r.request("pin/check", { currentPin: "012345", uid: "forged" });
+  assert.equal(result.result.verified, true);
+  assert.equal(r.calls.find(call => call[0] === "verify")[1].uid, "canonical-admin");
+  assert.ok(r.calls.every(call => ["status", "verify"].includes(call[0])));
+  assert.equal((await r.request("pin/check", {}, null)).status, 401);
+  assert.equal((await r.request("pin/check", {}, { actor: { uid: "patient", role: "patient" }, decoded: {} })).status, 401);
+  r.pins.verify = async () => { throw Object.assign(new Error("Too many attempts"), { status: 429 }); };
+  assert.equal((await r.request("pin/check", { currentPin: "012345" })).status, 429);
+});
+
+test("PIN enrollment confirmation requires fresh password login and cannot verify an invented current PIN", async () => {
+  const r = runtime(); r.pins.status = async () => ({ configured: false });
+  assert.equal((await r.request("pin/check", {})).result.verified, true);
+  assert.equal((await r.request("pin/check", { currentPin: "012345" })).status, 409);
+  assert.equal((await r.request("pin/check", {}, { actor: { uid: "staff", role: "staff" }, decoded: { auth_time: Date.now() / 1000 - 301 } })).status, 401);
+  assert.equal(r.calls.length, 0);
 });
 test("new account creation requires an emailed proof separately from the saved sign-in PIN", () => {
   const create = source.slice(source.indexOf('app.post("/api/staff/accounts",'), source.indexOf('app.patch("/api/staff/accounts/:userId"'));

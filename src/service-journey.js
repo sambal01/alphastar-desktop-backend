@@ -140,6 +140,21 @@ function update(root, entry, input, actor, now) {
   const timestamp=new Date(now).toISOString();
   if(['done','completed'].includes(input.status)) {
     if(!input.appointmentServiceId) fail('Reload the queue before completing this service.',409);
+    if (input.completeQueue === true) {
+      if (!['called', 'in_service', 'serving', 'in_consultation', 'in_progress', 'proceed_to_floor'].includes(entry.status) && !(entry.status === 'waiting' && entry.journeyStatus === 'proceed_to_floor')) fail('Call the patient before completing this queue.',409);
+      const appointment = entryAppointment(root, entry);
+      if (!appointment) fail('Appointment not found. Refresh the queue.',404);
+      for (const step of list) {
+        if (!step.completed_at) { step.queue_status = 'completed'; step.completed_at = timestamp; }
+      }
+      entry.status = 'done'; entry.journeyStatus = 'completed'; entry.completedAt = timestamp;
+      entry.nextService = ''; entry.nextFloor = ''; entry.nextRoom = '';
+      appointment.status = 'completed'; appointment.appointmentStatus = 'completed'; appointment.completedAt = timestamp; appointment.updatedAt = timestamp;
+      root.notifications ||= {};
+      const id = 'queue_completed_' + current.appointment_service_id;
+      root.notifications[id] = { id, userId: appointment.userId || appointment.patientUserId, type: 'queue', referenceId: appointment.id, referenceType: 'appointment', title: 'Visit completed', message: 'Your clinic queue visit is complete.', isRead: false, read: false, createdAt: timestamp, updatedAt: timestamp };
+      return true;
+    }
     if(!['in_service','serving'].includes(entry.status)) fail('Start the service before completing it.',409);
     const remaining = list.find(s=>s.sequence_number > current.sequence_number && !s.completed_at);
     if (remaining && service(root,remaining.service_id)?.status !== 'active') fail('The next service is inactive. Ask Admin to update the service before transfer.',409);

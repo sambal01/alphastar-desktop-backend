@@ -616,3 +616,50 @@ test("service locations are Admin-only and edits update the active destination",
   assert.throws(()=>journey.plan(visitSeed(),seed().appointments.apt_one,["lab","missing"]));
   assert.throws(()=>journey.plan(visitSeed(),seed().appointments.apt_one,["lab","lab"]));
 });
+
+test("Complete Queue finishes a called linked visit atomically without a Start Service request or transfer", async () => {
+  const f = fixture(visitSeed());
+  await f.request("post", "/api/staff/queue", { id: "complete_queue", appointmentId: "apt_one" }, "staff_auth");
+  const entry = f.read().queueEntries.complete_queue, params = { queueId: entry.id };
+  await f.request("patch", "/api/staff/queue/:queueId", { status: "called", appointmentServiceId: entry.appointmentServiceId }, "staff_auth", params);
+  const result = await f.request("patch", "/api/staff/queue/:queueId", { status: "done", completeQueue: true, appointmentServiceId: entry.appointmentServiceId }, "staff_auth", params);
+  assert.equal(result.status, 200); assert.equal(result.body.queueEntry.status, "done");
+  const root = f.read(), saved = root.queueEntries.complete_queue;
+  assert.equal(saved.queueNo, entry.queueNo); assert.equal(saved.journeyStatus, "completed");
+  assert.equal(saved.nextService, ""); assert.equal(saved.nextFloor, ""); assert.equal(saved.nextRoom, "");
+  assert.equal(root.appointments.apt_one.status, "completed"); assert.ok(saved.completedAt);
+  assert.ok(Object.values(root.appointmentServices).every(step => step.queue_status === "completed" && step.completed_at && !step.started_at), "Record the staff-attested completion without inventing service start times");
+  assert.equal(Object.keys(root.queueEntries).length, 1); assert.equal(Object.keys(root.notifications).length, 1);
+  assert.equal(Object.values(root.notifications)[0].userId, "patient_auth");
+  assert.equal(Object.values(root.notifications)[0].title, "Visit completed");
+  assert.equal(queue.liveSnapshot(root, "patient_auth", NOW).ownEntry.status, "completed");
+});
+
+test("Complete Queue cannot skip calling, use a stale service ID, or be submitted by a patient", async () => {
+  const f = fixture(visitSeed());
+  await f.request("post", "/api/staff/queue", { id: "guarded_queue", appointmentId: "apt_one" }, "staff_auth");
+  const entry = f.read().queueEntries.guarded_queue, params = { queueId: entry.id };
+  const body = { status: "done", completeQueue: true, appointmentServiceId: entry.appointmentServiceId };
+  const before = f.read();
+  assert.equal((await f.request("patch", "/api/staff/queue/:queueId", body, "staff_auth", params)).status, 409);
+  assert.deepEqual(f.read(), before, "Rejected completion is fully rolled back");
+  await f.request("patch", "/api/staff/queue/:queueId", { status: "called", appointmentServiceId: entry.appointmentServiceId }, "staff_auth", params);
+  const called = f.read();
+  assert.equal((await f.request("patch", "/api/staff/queue/:queueId", { ...body, appointmentServiceId: "stale-service" }, "staff_auth", params)).status, 409);
+  assert.equal((await f.request("patch", "/api/staff/queue/:queueId", body, "patient_auth", params)).status, 403);
+  assert.deepEqual(f.read(), called);
+});
+
+test("simultaneous Complete Queue retries keep one ticket and one patient notice without a next-floor transfer", async () => {
+  const f = fixture(visitSeed());
+  await f.request("post", "/api/staff/queue", { id: "retry_queue", appointmentId: "apt_one" }, "staff_auth");
+  const entry = f.read().queueEntries.retry_queue, params = { queueId: entry.id };
+  await f.request("patch", "/api/staff/queue/:queueId", { status: "called", appointmentServiceId: entry.appointmentServiceId }, "staff_auth", params);
+  const request = () => f.request("patch", "/api/staff/queue/:queueId", { status: "done", completeQueue: true, appointmentServiceId: entry.appointmentServiceId }, "staff_auth", params);
+  const results = await Promise.all([request(), request()]);
+  assert.ok(results.every(result => result.status === 200));
+  const root = f.read();
+  assert.equal(root.queueEntries.retry_queue.status, "done"); assert.equal(Object.keys(root.queueEntries).length, 1);
+  assert.equal(Object.keys(root.notifications).length, 1);
+  assert.ok(Object.values(root.appointmentServices).every(step => step.completed_at));
+});
