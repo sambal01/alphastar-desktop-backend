@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { createChatLifecycle, publicSummary } = require("./native-chat-lifecycle");
 const { transactionWithLiveSnapshot } = require("./realtime-transaction");
 const { createPatientAuthenticatorAccess } = require("./patient-authenticator-access");
+const { staffSupportHours } = require("./staff-support-hours");
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
 const clean = (value, max) => typeof value === "string" ? value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim().slice(0, max) : "";
 const problem = (status, message) => Object.assign(Error(message), { status });
@@ -98,6 +99,7 @@ function registerNativeChatRoutes(app, options) {
     }
     return lifecycle.send(db, id, actor, { ...body, text });
   }
+  app.get("/api/support/hours", route(async (_req, res) => res.json({ ok: true, supportHours: staffSupportHours(now()) })));
   app.post("/api/support/chats", route(async (req, res) => {
     rate(`open:${hash(String(req.ip || req.socket?.remoteAddress || "unknown"))}`, 10);
     const name = clean(req.body?.name, 100), email = clean(req.body?.email, 255).toLowerCase();

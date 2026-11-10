@@ -1,6 +1,13 @@
 const test = require("node:test"), assert = require("node:assert/strict");
 const { staffSupportHours } = require("../src/staff-support-hours");
 const fixture = require("./helpers/native-feedback-fixture.cjs");
+test("the public hours endpoint exposes only the current support window without touching patient records", async () => {
+  const f = fixture({ now: () => Date.parse("2026-11-10T09:00:00Z") }), before = JSON.stringify(f.root);
+  const result = await f.invoke("GET", "/api/support/hours");
+  assert.equal(result.code, 200); assert.equal(result.body.supportHours.open, false);
+  assert.equal(result.body.supportHours.timeZone, "Asia/Manila");
+  assert.equal(JSON.stringify(f.root), before);
+});
 test("Staff Support uses Manila time, opens at 7 AM, includes lunch and closes exactly at 5 PM", () => {
   for (const [instant, open] of [["2026-11-09T22:59:59.999Z", false], ["2026-11-09T23:00:00Z", true], ["2026-11-10T04:00:00Z", true], ["2026-11-10T08:59:59.999Z", true], ["2026-11-10T09:00:00Z", false], ["2026-11-10T22:59:59Z", false], ["2026-11-10T23:00:00Z", true]]) {
     const hours = staffSupportHours(Date.parse(instant));
