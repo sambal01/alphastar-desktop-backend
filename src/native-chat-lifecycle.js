@@ -1,32 +1,34 @@
 "use strict";
 const crypto = require("node:crypto");
 const { transactionWithLiveSnapshot: transact } = require("./realtime-transaction");
+const { staffSupportHours, assertStaffSupportOpen } = require("./staff-support-hours");
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
 const fail = (status, message) => { throw Object.assign(Error(message), { status }); };
-const WELCOME = "Hello! 👋 Welcome to AlphaStar Clinic Support. Would you like to connect with a support assistant for help with your appointment, clinic services, account, or another concern?";
-const ACK = "Thank you! 😊 We’ve received your request. Please wait while an AlphaStar Clinic support assistant reviews your message. We’ll respond as soon as possible. During busy periods, replies may take 24 hours or longer.";
+const WELCOME = "Hello! 👋 Welcome to AlphaStar Clinic Support. Would you like to connect with a support assistant for help with clinic services, medical forms, your account, or another concern? Staff Support is available daily from 7:00 AM to 5:00 PM (Philippine time).";
+const ACK = "Thank you! 😊 We’ve received your request. Please wait for an AlphaStar Clinic support assistant. Staff Support is available daily from 7:00 AM to 5:00 PM (Philippine time). Replies depend on staff availability.";
 const LEASE_MS = 90000;
 const TYPING_MS = 8000;
 const initials = name => String(name || "").trim().split(/\s+/u).filter(Boolean).filter(part => !part.includes("@")).map((part, index, parts) => index === 0 || index === parts.length - 1 ? Array.from(part)[0] : "").join("").toLocaleUpperCase().slice(0, 4) || "?";
 const publicKeys = ["id", "provider", "visitorName", "visitorEmail", "source", "status", "createdAt", "updatedAt", "lastMessage", "requestedAt", "connectedAt", "endedAt", "connectedName", "connectedRole", "cycle", "visitorSequence"];
 function publicSummary(row, actor, now = Date.now()) {
   const result = Object.fromEntries(publicKeys.filter(key => row[key] !== undefined).map(key => [key, row[key]]));
+  result.supportHours = staffSupportHours(now);
   result.visitorInitials = initials(row.visitorName);
   result.connectedAvatar = row._connection?.avatar || "clinic";
   result.connectedInitials = row._connection?.initials || "";
   result.typing = {};
   for (const sender of ["visitor", "staff"]) {
     const marker = row._typing?.[sender];
-    if (["waiting", "connected"].includes(row.status) && marker?.cycle === row.cycle && marker.until > now && (sender !== "staff" || row.status === "connected" && marker.uid === row._connection?.uid)) {
+    if (result.supportHours.open && ["waiting", "connected"].includes(row.status) && marker?.cycle === row.cycle && marker.until > now && (sender !== "staff" || row.status === "connected" && marker.uid === row._connection?.uid)) {
       result.typing[sender] = { expiresAt: marker.until };
     }
   }
   if (actor) {
-    result.canConnect = row.status === "waiting";
-    result.canReply = row.status === "connected" && row._connection?.uid === actor.uid;
+    result.canConnect = result.supportHours.open && row.status === "waiting";
+    result.canReply = result.supportHours.open && row.status === "connected" && row._connection?.uid === actor.uid;
     result.canEnd = ["waiting", "connected"].includes(row.status) && (actor.role === "admin" || row._connection?.uid === actor.uid);
     result.unread = (row.visitorSequence || 0) > (row._readBy?.[actor.uid] || 0);
-    if (result.canReply) result.connectedIdentity = row._connection.identity === "first_name" ? "account" : row._connection.identity === "anonymous" ? "clinic" : row._connection.identity;
+    if (row.status === "connected" && row._connection?.uid === actor.uid) result.connectedIdentity = row._connection.identity === "first_name" ? "account" : row._connection.identity === "anonymous" ? "clinic" : row._connection.identity;
     if (row._feedback?.[row.cycle]) result.feedback = row._feedback[row.cycle];
   }
   return result;
@@ -117,6 +119,7 @@ function createChatLifecycle(now = () => Date.now()) {
   }
   async function request(db, id, body, patient, legacy = false) {
     return change(db, id, row => {
+      assertStaffSupportOpen(now());
       cycle(row, body);
       if (row.status === "ended") {
         if (!patient) fail(409, "This conversation has ended. Open a new chat.");
@@ -135,6 +138,7 @@ function createChatLifecycle(now = () => Date.now()) {
   async function connect(db, id, actor, body, savedName) {
     if (!["anonymous", "first_name", "account", "clinic"].includes(body?.identity)) fail(400, "Choose Your account or Alphastar Staff.");
     return change(db, id, row => {
+      assertStaffSupportOpen(now());
       cycle(row, body);
       const account = ["account", "first_name"].includes(body.identity);
       if (row.status === "connected" && row._connection?.uid === actor.uid) {
@@ -157,6 +161,7 @@ function createChatLifecycle(now = () => Date.now()) {
         if (accepted.fingerprint !== fingerprint || accepted.cycle !== body.cycle) fail(409, "That message reference was already used.");
         return accepted.id;
       }
+      assertStaffSupportOpen(now());
       cycle(row, body);
       if (actor.sender === "staff") {
         if (row.status !== "connected" || row._connection?.uid !== actor.key) fail(403, "Connect to this chat before replying.");
@@ -204,6 +209,7 @@ function createChatLifecycle(now = () => Date.now()) {
   async function typing(db, id, actor, body) {
     if (typeof body?.isTyping !== "boolean" || !/^[a-f0-9-]{20,80}$/i.test(body.clientId || "") || !Number.isSafeInteger(body.sequence) || body.sequence < 1) fail(400, "Invalid typing indicator.");
     return change(db, id, row => {
+      if (body.isTyping) assertStaffSupportOpen(now());
       cycle(row, body);
       if (actor.sender === "staff" && (row.status !== "connected" || row._connection?.uid !== actor.key)) fail(403, "Connect to this chat before replying.");
       if (!["waiting", "connected"].includes(row.status)) fail(409, "This conversation is not active.");

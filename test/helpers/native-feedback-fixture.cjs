@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const { registerHumanChatRoutes } = require('../../src/human-chat');
 
-module.exports = function fixture() {
+module.exports = function fixture(options = {}) {
   const root = { users: { patient: { role: 'patient', fullName: 'Synthetic Patient', email: 'patient@example.test' } } }, handlers = new Map();
   const value = path => path ? path.split('/').reduce((row, key) => row?.[key], root) : root;
   const set = (path, row) => { const keys = path.split('/'), last = keys.pop(); let target = root; for (const key of keys) target = target[key] ||= {}; target[last] = structuredClone(row); };
@@ -20,7 +20,7 @@ module.exports = function fixture() {
     async update(patch) { for (const [key, row] of Object.entries(patch)) set(path ? path + '/' + key : key, row); },
   }; } };
   registerHumanChatRoutes({ post(path, handler) { handlers.set('POST ' + path, handler); }, get(path, handler) { handlers.set('GET ' + path, handler); } }, {
-    now: () => Date.parse('2026-11-05T02:00:00Z'), getFirebaseApp: () => ({}), getDatabase: () => db,
+    now: options.now || (() => Date.parse('2026-11-05T02:00:00Z')), getFirebaseApp: () => ({}), getDatabase: () => db,
     getAuth: () => ({ async verifyIdToken(token, revoked) { assert.equal(revoked, true); if (!root.users[token]) throw Error('Invalid token'); return { uid: token, email: root.users[token].email }; } }),
   });
   async function invoke(method, path, extra = {}) {

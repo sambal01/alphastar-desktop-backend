@@ -54,7 +54,7 @@ test("request is idempotent, notifies staff and records the named visitor and Sy
  const messages=a.body.conversation.messages;
  assert.deepEqual(messages.map(row=>row.sender),["system","visitor","system"]);
  assert.equal(messages[1].name,"Synthetic Visitor");
- assert.match(messages[2].text,/24 hours or longer/);
+ assert.match(messages[2].text,/7:00 AM to 5:00 PM/);
  assert.equal(Object.keys(f.root.notifications).length,1);
  const notice=Object.values(f.root.notifications)[0];
  assert.deepEqual(notice.targetRoles,["admin","staff"]);assert.equal(notice.referenceId,opened.id);
