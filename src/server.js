@@ -3406,7 +3406,7 @@ app.get("/api/ready/firebase", createFirebaseReadiness({ getFirebaseApp: firebas
 
 app.get("/api/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1 } });
+  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { desktopPasswordResetLink: desktopResetLinkFallbackEnabled ? 1 : 0, staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1 } });
 });
 
 app.post("/api/auth/account-status", async (req, res) => {
@@ -3495,10 +3495,11 @@ app.post("/api/auth/login", async (req, res) => {
 
 
 const desktopResetPurpose = "desktop_password_reset_otp";
+const desktopResetLinkFallbackEnabled = process.env.DESKTOP_PASSWORD_RESET_LINK_FALLBACK !== "false";
 app.post("/api/password-reset/otp/send", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
   let challenge;
   try {
-    const email = normalizeEmail(req.body.email);
     if (!isValidEmail(email)) throw new Error("Enter a valid email address.");
     if (!await registeredDatabaseAccount(email, "staff")) throw passwordResetEmailNotRegisteredError("staff");
     const user = await getAuth(firebaseAdminApp()).getUserByEmail(email);
@@ -3516,7 +3517,20 @@ app.post("/api/password-reset/otp/send", async (req, res) => {
       }),
     });
     res.json({ ok: true, challengeToken: challenge.challengeToken, expiresAt: challenge.expiresAt });
-  } catch (error) { if (challenge) forgetChallenge(challenge.challengeToken); sendError(res, error); }
+  } catch (error) {
+    if (challenge) forgetChallenge(challenge.challengeToken);
+    if (!challenge || !desktopResetLinkFallbackEnabled || req.body?.acceptResetLink !== true || error?.code !== "EMAIL_DELIVERY_UNAVAILABLE") {
+      return sendError(res, error);
+    }
+
+    try {
+      await firebaseRequest("accounts:sendOobCode", { requestType: "PASSWORD_RESET", email });
+      res.json({ ok: true, delivery: "firebase-reset-link" });
+    } catch {
+      console.warn("Firebase password reset link delivery failed.");
+      sendError(res, emailUnavailableError());
+    }
+  }
 });
 app.post("/api/password-reset/otp/verify", (req, res) => {
   try {

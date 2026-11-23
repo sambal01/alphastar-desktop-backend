@@ -25,6 +25,8 @@ services:
         sync: false
       - key: AUTH_CHALLENGE_SECRET
         sync: false
+      - key: DESKTOP_PASSWORD_RESET_LINK_FALLBACK
+        value: "true"
       - key: EMAIL_PROVIDER
         value: brevo
       - key: EMAIL_FROM_ADDRESS
