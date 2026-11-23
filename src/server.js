@@ -19,7 +19,7 @@ const { createStaffAccountPin } = require("./staff-account-pin");
 const { cert, getApp, getApps, initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getDatabase } = require("firebase-admin/database");
-const { getFirestore } = require("firebase-admin/firestore");
+const { initializeFirestore } = require("firebase-admin/firestore");
 const { createFirebaseReadiness } = require("./firebase-readiness");
 const nodemailer = require("nodemailer");
 const { emailProvider, brevoConfig, brevoReady, emailUnavailableError, sendMailViaBrevo } = require("./email-delivery");
@@ -2978,6 +2978,10 @@ async function deleteFirebaseAuthSessionUser(idToken = "") {
   }
 }
 
+function getBackendFirestore(firebaseApp) {
+  return initializeFirestore(firebaseApp, { preferRest: true });
+}
+
 function firebaseAdminApp() {
   if (getApps().length) return getApp();
 
@@ -3398,7 +3402,7 @@ app.use(["/api/staff/accounts", "/api/staff/patient-accounts", "/api/staff-auth/
   catch (error) { sendError(res, error); }
 });
 
-app.get("/api/ready/firebase", createFirebaseReadiness({ getFirebaseApp: firebaseAdminApp, getDatabase, getFirestore }));
+app.get("/api/ready/firebase", createFirebaseReadiness({ getFirebaseApp: firebaseAdminApp, getDatabase, getFirestore: getBackendFirestore }));
 
 app.get("/api/health", (_req, res) => {
   res.set("Cache-Control", "no-store");

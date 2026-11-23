@@ -8,12 +8,18 @@ const unavailable = {
   firestore: false,
 };
 
-async function reachable(read) {
+function errorCode(error) {
+  const code = error?.code ?? error?.status;
+  if (typeof code === "number") return code;
+  return typeof code === "string" && /^[a-z0-9_/-]{1,60}$/i.test(code) ? code : "READ_FAILED";
+}
+
+async function probe(read) {
   let timer;
   try {
     return await Promise.race([
-      Promise.resolve().then(read).then(() => true, () => false),
-      new Promise(resolve => { timer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MS); }),
+      Promise.resolve().then(read).then(() => null, errorCode),
+      new Promise(resolve => { timer = setTimeout(() => resolve("PROBE_TIMEOUT"), PROBE_TIMEOUT_MS); }),
     ]);
   } finally {
     clearTimeout(timer);
@@ -22,32 +28,42 @@ async function reachable(read) {
 
 function createFirebaseReadiness({ getFirebaseApp, getDatabase, getFirestore }) {
   let result;
+  let previousErrors = {};
   let nextProbeAt = 0;
   let probePending = false;
 
   async function checkFirebase() {
     const app = getFirebaseApp();
-    if (!app) return unavailable;
+    if (!app) return ["ADMIN_UNAVAILABLE", "ADMIN_UNAVAILABLE"];
 
-    const [realtimeDatabase, firestore] = await Promise.all([
-      reachable(() => getDatabase(app).ref("clinicSettings/availability").get()),
-      reachable(() => getFirestore(app).doc("_alphastarReadiness/connection").get()),
+    return Promise.all([
+      probe(() => getDatabase(app).ref("clinicSettings/availability").get()),
+      probe(() => getFirestore(app).doc("_alphastarReadiness/connection").get()),
     ]);
-    return { ok: realtimeDatabase && firestore, realtimeDatabase, firestore };
   }
 
   async function refreshReadiness() {
-    const latest = await checkFirebase().catch(() => unavailable);
-    const stateChanged = result?.realtimeDatabase !== latest.realtimeDatabase
-      || result?.firestore !== latest.firestore;
+    const [realtimeDatabaseError, firestoreError] = await checkFirebase().catch(error => {
+      const code = errorCode(error);
+      return [code, code];
+    });
+    const realtimeDatabase = realtimeDatabaseError === null;
+    const firestore = firestoreError === null;
+    const latest = { ok: realtimeDatabase && firestore, realtimeDatabase, firestore };
+    const stateChanged = previousErrors.realtimeDatabaseError !== realtimeDatabaseError
+      || previousErrors.firestoreError !== firestoreError;
+
     if (stateChanged && !latest.ok) {
       console.warn("Firebase readiness check failed.", {
-        realtimeDatabase: latest.realtimeDatabase,
-        firestore: latest.firestore,
+        ...latest,
+        realtimeDatabaseError,
+        firestoreError,
       });
     } else if (stateChanged && result && latest.ok) {
       console.info("Firebase readiness restored.");
     }
+
+    previousErrors = { realtimeDatabaseError, firestoreError };
     result = latest;
     nextProbeAt = Date.now() + (result.ok ? SUCCESS_REFRESH_MS : FAILURE_RETRY_MS);
     probePending = false;

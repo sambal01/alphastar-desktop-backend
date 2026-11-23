@@ -47,7 +47,7 @@ test("responds during a cold probe and waits for both databases to become ready"
 test("reports the failed database and retries so health can recover", async ({ mock }) => {
   let now = 1_000;
   mock.method(Date, "now", () => now);
-  mock.method(console, "warn", () => {});
+  const warn = mock.method(console, "warn", () => {});
   mock.method(console, "info", () => {});
   let firestoreReady = false;
   const check = createFirebaseReadiness({
@@ -56,7 +56,7 @@ test("reports the failed database and retries so health can recover", async ({ m
     getFirestore: () => ({
       doc: () => ({
         async get() {
-          if (!firestoreReady) throw new Error("Unavailable");
+          if (!firestoreReady) throw Object.assign(new Error("Private configuration details"), { code: 7 });
         },
       }),
     }),
@@ -68,6 +68,11 @@ test("reports the failed database and retries so health can recover", async ({ m
     statusCode: 503,
     body: { ok: false, realtimeDatabase: true, firestore: false },
   });
+
+  assert.deepEqual(warn.mock.calls[0].arguments, [
+    "Firebase readiness check failed.",
+    { ok: false, realtimeDatabase: true, firestore: false, realtimeDatabaseError: null, firestoreError: 7 },
+  ]);
 
   now += 5_000;
   firestoreReady = true;
