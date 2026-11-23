@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: alphastar-staff-api
+    runtime: node
+    region: singapore
+    plan: free
+    autoDeployTrigger: "off"
+    buildCommand: npm ci && npm run check
+    startCommand: npm start
+    healthCheckPath: /api/ready/firebase
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      - key: FIREBASE_API_KEY
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: STAFF_ACCOUNT_PIN_ENABLED
+        value: "true"
+      - key: STAFF_PIN_PEPPER
+        sync: false
+      - key: AUTH_CHALLENGE_SECRET
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: brevo
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
