@@ -37,3 +37,5 @@ services:
         value: firestore
       - key: CLINICAL_WORKFLOWS_ENABLED
         value: "false"
+      - key: BREVO_DIAGNOSTICS_ENABLED
+        value: "true"

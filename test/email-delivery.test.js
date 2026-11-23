@@ -142,3 +142,20 @@ test("SMTP still works on supported hosts and invalid providers cannot silently 
   assert.equal(invalid.emailReady(), false);
   await assert.rejects(invalid.sendMail(message), { status: 503 });
 });
+
+test("Brevo readiness reports blocked egress without sending an email or exposing provider details", async () => {
+  const { createBrevoStatusCheck } = require("../src/email-delivery");
+  let requests = 0;
+  const check = createBrevoStatusCheck({
+    env: { EMAIL_PROVIDER: "brevo", BREVO_API_KEY: "synthetic", EMAIL_FROM_ADDRESS: "clinic@example.invalid" },
+    fetchImpl: async (url, options) => {
+      requests++;
+      assert.equal(url, "https://api.brevo.com/v3/senders");
+      assert.equal(options.method, undefined);
+      return { status: 401, json: async () => ({ message: "Unrecognized IP address 192.0.2.4" }) };
+    },
+  });
+  assert.deepEqual(await Promise.all([check(), check()]), ["outbound-ip-rejected", "outbound-ip-rejected"]);
+  assert.equal(await check(), "outbound-ip-rejected");
+  assert.equal(requests, 1);
+});

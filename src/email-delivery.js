@@ -63,4 +63,44 @@ async function sendMailViaBrevo(message, { env = process.env, fetchImpl = global
   }
 }
 
-module.exports = { emailProvider, brevoConfig, brevoReady, emailUnavailableError, sendMailViaBrevo };
+function createBrevoStatusCheck({ env = process.env, fetchImpl = globalThis.fetch } = {}) {
+  let cachedStatus;
+  let nextCheck = 0;
+  let pending;
+
+  async function check() {
+    if (emailProvider(env) !== "brevo") return "other-provider";
+    if (!brevoReady(env)) return "missing-settings";
+    const { apiKey, fromEmail } = brevoConfig(env);
+
+    try {
+      const response = await fetchImpl("https://api.brevo.com/v3/senders", {
+        headers: { "api-key": apiKey, Accept: "application/json" },
+        signal: AbortSignal.timeout(7000),
+      });
+      const body = await response.json().catch(() => null);
+      if (response.status === 401 || response.status === 403) {
+        if (/ip address/i.test(String(body?.message || ""))) return "outbound-ip-rejected";
+        return response.status === 401 ? "key-rejected" : "sender-check-forbidden";
+      }
+      if (!response.ok || !Array.isArray(body?.senders)) return "brevo-unavailable";
+      const sender = body.senders.find(item => typeof item?.email === "string" &&
+        item.email.trim().toLowerCase() === fromEmail.toLowerCase());
+      return sender?.active === true ? "sender-active" : "sender-inactive-or-unlisted";
+    } catch {
+      return "brevo-unavailable";
+    }
+  }
+
+  return function brevoStatus() {
+    if (Date.now() < nextCheck) return Promise.resolve(cachedStatus);
+    pending ||= check().then(status => {
+      cachedStatus = status;
+      nextCheck = Date.now() + 5 * 60 * 1000;
+      return status;
+    }).finally(() => { pending = null; });
+    return pending;
+  };
+}
+
+module.exports = { emailProvider, brevoConfig, brevoReady, emailUnavailableError, sendMailViaBrevo, createBrevoStatusCheck };

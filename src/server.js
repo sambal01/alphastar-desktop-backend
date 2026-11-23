@@ -25,7 +25,7 @@ const { getDatabase } = require("firebase-admin/database");
 const { initializeFirestore } = require("firebase-admin/firestore");
 const { createFirebaseReadiness } = require("./firebase-readiness");
 const nodemailer = require("nodemailer");
-const { emailProvider, brevoConfig, brevoReady, emailUnavailableError, sendMailViaBrevo } = require("./email-delivery");
+const { emailProvider, brevoConfig, brevoReady, emailUnavailableError, sendMailViaBrevo, createBrevoStatusCheck } = require("./email-delivery");
 
 dotenv.config({ path: path.resolve(__dirname, "../.env"), quiet: true });
 dotenv.config({ override: false, quiet: true });
@@ -3409,9 +3409,13 @@ app.get("/api/ready/firebase", createFirebaseReadiness({ getFirebaseApp: firebas
 
 const clinicalWorkflowsAvailable = process.env.CLINICAL_WORKFLOWS_ENABLED === "true";
 
-app.get("/api/ready", (_req, res) => {
+const checkBrevoStatus = createBrevoStatusCheck();
+
+app.get("/api/ready", async (req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, service: "alphastar-desktop-backend", clinicalRecords: clinicalWorkflowsAvailable ? 1 : 0, clinicalWorkflow: clinicalWorkflowsAvailable ? 3 : 0, clinicalMultiService: clinicalWorkflowsAvailable, clinicalVisitHistoryReports: clinicalWorkflowsAvailable, otpEmailConfigured: emailReady() });
+  const otpEmailStatus = req.query.email === "1" && process.env.BREVO_DIAGNOSTICS_ENABLED === "true"
+    ? await checkBrevoStatus() : undefined;
+  res.json({ otpEmailStatus, ok: true, service: "alphastar-desktop-backend", clinicalRecords: clinicalWorkflowsAvailable ? 1 : 0, clinicalWorkflow: clinicalWorkflowsAvailable ? 3 : 0, clinicalMultiService: clinicalWorkflowsAvailable, clinicalVisitHistoryReports: clinicalWorkflowsAvailable, otpEmailConfigured: emailReady() });
 });
 
 app.get("/api/health", (_req, res) => {
