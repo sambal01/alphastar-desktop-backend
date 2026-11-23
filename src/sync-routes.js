@@ -1,7 +1,7 @@
 "use strict";
 
 const STAFF_ROLES = new Set(["admin", "staff", "doctor", "nurse", "receptionist"]);
-const STAFF_PATHS = Object.freeze(["users", "patientProfiles", "staff", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "services", "schedules", "clinicSettings", "inventory", "stockTransactions", "auditLogs", "humanChats"]);
+const STAFF_PATHS = Object.freeze(["users", "patientProfiles", "desktopPatientRecordRemovals", "staff", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "services", "schedules", "clinicSettings", "inventory", "stockTransactions", "auditLogs", "humanChats"]);
 const PATIENT_PATHS = Object.freeze(["users", "patientProfiles", "appointments", "appointmentServices", "queueEntries", "medicalRecords", "notifications", "payments"]);
 
 class SyncError extends Error {

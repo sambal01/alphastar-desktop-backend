@@ -20,7 +20,7 @@ function active(value) {
 function assertAdministrator(root, actor) {
   const administrator = root.users?.[actor.uid], staff = root.staff?.[actor.uid];
   if (!active(administrator) || (staff && !active(staff)) || String(administrator.role || administrator.accountRole || "").toLowerCase() !== "admin") {
-    throw new PatientRecordError("Only an active administrator can save patient contact details.", 403, "PATIENT_RECORD_FORBIDDEN");
+    throw new PatientRecordError("Only an active administrator can manage patient records.", 403, "PATIENT_RECORD_FORBIDDEN");
   }
 }
 function clinicRecordId(value) {
@@ -54,6 +54,7 @@ function updatePatientRecord(root, uid, input, actor, now, eventId) {
   if (!user || user.deleted || user.deletedAt || String(user.role || user.accountRole || "").toLowerCase() !== "patient") {
     throw new PatientRecordError("The registered patient account was not found. Refresh and select it again.", 404, "PATIENT_RECORD_NOT_FOUND");
   }
+  if (root.desktopPatientRecordRemovals?.[uid]) throw new PatientRecordError("This patient record was removed from the directory.", 409, "PATIENT_RECORD_CONFLICT");
   const patch = patientPatch(input, now), timestamp = new Date(now).toISOString();
   const profile = { ...(root.patientProfiles?.[uid] || {}), ...patch, userId: uid, updatedAt: timestamp, updatedBy: actor.uid };
   // All aliases read by desktop/mobile must agree after a contact correction.
@@ -81,7 +82,7 @@ function saveClinicPatientRecord(root, id, input, actor, now, eventId) {
   assertAdministrator(root, actor);
   clinicRecordId(id);
   const prior = root.patientProfiles?.[id];
-  if (root.users?.[id] || (prior && (prior.recordKind !== "clinic_only" || prior.recordId !== id || prior.userId || prior.deleted || prior.deletedAt))) {
+  if (root.users?.[id] || root.desktopPatientRecordRemovals?.[id] || (prior && (prior.recordKind !== "clinic_only" || prior.recordId !== id || prior.userId || prior.deleted || prior.deletedAt))) {
     throw new PatientRecordError("This is not an editable clinic-only patient record.", 409, "PATIENT_RECORD_CONFLICT");
   }
   const patch = clinicPatientPatch(input, now), timestamp = new Date(now).toISOString();
@@ -104,7 +105,66 @@ function publicClinicProfile(profile) {
   return Object.fromEntries(["recordId", "recordKind", "patientNumber", "fullName", "birthDate", "gender", "phone", "email", "address", "createdAt", "updatedAt"]
     .filter(key => profile[key] !== undefined).map(key => [key, profile[key]]));
 }
+function removePatientRecord(root, id, kind, actor, now, eventId) {
+  assertAdministrator(root, actor);
+  const profile = root.patientProfiles?.[id];
+  const user = root.users?.[id];
+  const matchesClinic = !user && profile?.recordKind === "clinic_only" && profile.recordId === id && !profile.userId;
+  const matchesRegistered = String(user?.role || user?.accountRole || "").toLowerCase() === "patient" && profile?.recordKind !== "clinic_only";
+  if (!(kind === "clinic" ? matchesClinic : matchesRegistered)) {
+    throw new PatientRecordError("Patient record not found. Reopen Patient Records and try again.", 404, "PATIENT_RECORD_NOT_FOUND");
+  }
+  if (root.desktopPatientRecordRemovals?.[id]?.removedAt) return root.desktopPatientRecordRemovals[id].removedAt;
+
+  const timestamp = new Date(now).toISOString();
+  root.desktopPatientRecordRemovals ||= {};
+  root.desktopPatientRecordRemovals[id] = { removedAt: timestamp, removedBy: actor.uid };
+  root.auditLogs ||= {};
+  root.auditLogs[eventId] = { id: eventId, actorId: actor.uid, actorRole: "admin", action: "patient_record_removed",
+    targetType: "patientProfiles", targetId: id, source: "desktop", timestamp, createdAt: timestamp };
+  return timestamp;
+}
+
 function registerPatientRecordRoutes(app, options = {}) {
+  app.get("/api/staff/patient-record-removals", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const access = req.staffAccess;
+    if (!access?.database || !access.actor?.uid) return res.status(401).json({ ok: false, error: "Sign in to the desktop again." });
+    try {
+      const saved = (await access.database.ref("desktopPatientRecordRemovals").get()).val() || {};
+      res.json({ ok: true, removals: Object.fromEntries(Object.entries(saved).map(([id, row]) => [id, row.removedAt])) });
+    } catch {
+      res.status(503).json({ ok: false, error: "Patient record removals could not be loaded. Please try again." });
+    }
+  });
+  app.delete("/api/staff/patient-records/:recordId", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const access = req.staffAccess;
+      if (!access?.database || !access.actor?.uid) throw new PatientRecordError("Sign in to the desktop again.", 401, "PATIENT_RECORD_UNAUTHORIZED");
+      if (access.actor.role !== "admin") throw new PatientRecordError("Only an administrator can delete patient records.", 403, "PATIENT_RECORD_FORBIDDEN");
+      const { kind, confirm } = req.body || {};
+      if (confirm !== true || !["clinic", "registered"].includes(kind)) throw new PatientRecordError("Confirm the selected patient record before deleting it.");
+      const id = kind === "clinic" ? clinicRecordId(req.params.recordId) : safeUid(req.params.recordId);
+      const now = (options.now || Date.now)();
+      const eventId = "patient_record_" + crypto.randomUUID();
+      let failure, removedAt;
+      const result = await transactionWithLiveSnapshot(access.database.ref(), current => {
+        failure = undefined;
+        removedAt = undefined;
+        const root = structuredClone(current || {});
+        try { removedAt = removePatientRecord(root, id, kind, access.actor, now, eventId); return root; }
+        catch (error) { failure = error; return undefined; }
+      });
+      if (failure) throw failure;
+      if (!result.committed || !removedAt) throw new PatientRecordError("The patient record changed. Try again.", 409, "PATIENT_RECORD_CONFLICT");
+      res.json({ ok: true, recordId: id, removedAt });
+    } catch (error) {
+      res.status(error instanceof PatientRecordError ? error.status : 503).json({ ok: false,
+        code: error instanceof PatientRecordError ? error.code : "PATIENT_RECORD_UNAVAILABLE",
+        error: error instanceof PatientRecordError ? error.message : "The patient record could not be removed. Please try again." });
+    }
+  });
   app.put("/api/staff/clinic-patients/:recordId", async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
