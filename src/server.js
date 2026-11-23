@@ -4174,23 +4174,12 @@ app.post("/api/staff/accounts/:userId/deletion-code", async (req, res) => {
   const targetUserId = normalizeUserId(req.params.userId);
   try {
     if (!targetUserId) throw new Error("Invalid account reference.");
-    if (targetUserId === actor.uid) {
-      return res.status(403).json({ ok: false, error: "You cannot delete the account currently signed in." });
-    }
+    await desktopAccounts().deletionTarget(targetUserId, actor);
     if (!emailReady()) {
       return res.status(503).json({
         ok: false,
         error: emailUnavailableError().message,
       });
-    }
-    const target = await getDatabase(firebaseAdminApp()).ref(`users/${targetUserId}`).get();
-    const targetRecord = target.val();
-    const targetRole = String(targetRecord?.role || targetRecord?.accountRole || "").toLowerCase();
-    if (!targetRecord || !staffRoles.has(targetRole)) {
-      return res.status(404).json({ ok: false, error: "Account not found. Refresh the account list." });
-    }
-    if (targetRole === "admin") {
-      return res.status(403).json({ ok: false, error: "Administrator accounts cannot be deleted." });
     }
     const recipientName = await recipientNameForAccount({
       audience: "staff",
@@ -4208,13 +4197,13 @@ app.post("/api/staff/accounts/:userId/deletion-code", async (req, res) => {
         html: securityCodeEmailHtml({
           appLabel: "Alphastar desktop app",
           code: challenge.code,
-          description: "Use this one-time PIN code to confirm deletion of a Staff Portal account. This action permanently removes that account's sign-in access.",
+          description: "Use this one-time code to confirm deletion of a Desktop Account. This action permanently removes that account's sign-in access.",
           expiresLabel: challengeDurationLabel,
           recipientName,
-          title: "Confirm Staff Portal account deletion",
+          title: "Confirm Desktop Account deletion",
         }),
-        subject: "Alphastar account deletion PIN code",
-        text: `Your Alphastar account deletion PIN code is ${challenge.code}. It expires in ${challengeDurationLabel}. Do not share it with anyone.`,
+        subject: "AlphaStar account deletion OTP",
+        text: `Your AlphaStar account deletion OTP is ${challenge.code}. It expires in ${challengeDurationLabel}. Do not share it with anyone.`,
         to: actor.email,
       });
     } catch (error) {
@@ -4226,7 +4215,7 @@ app.post("/api/staff/accounts/:userId/deletion-code", async (req, res) => {
       challengeToken: challenge.challengeToken,
       expiresAt: challenge.expiresAt,
       maskedEmail: maskEmail(actor.email),
-      message: `Deletion PIN code sent to ${maskEmail(actor.email)}.`,
+      message: `Deletion OTP sent to ${maskEmail(actor.email)}.`,
     });
   } catch (error) { sendError(res, error); }
 });

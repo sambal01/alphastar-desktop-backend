@@ -46,6 +46,25 @@ function accountId(value) {
   return uid;
 }
 
+function isActiveAdministrator(record) {
+  return record?.role === "admin" && record.active !== false &&
+    !record.disabled && !record.deletedAt && !record.accountDeletionPending &&
+    ![record.status, record.accountStatus].some(value => /^(inactive|disabled|blocked|suspended|deleted)$/i.test(String(value || "")));
+}
+
+function removableAccount(users, uid) {
+  const user = users?.[uid];
+  if (!user) throw new AccountError("Account not found. Refresh the account list.", 404, "ACCOUNT_NOT_FOUND");
+  const role = String(user.role || user.accountRole || "").toLowerCase();
+  if (!["admin", "staff", "doctor", "nurse", "receptionist"].includes(role)) {
+    throw new AccountError("Only clinic accounts can be deleted here.", 403, "ACCOUNT_DELETE_PROTECTED");
+  }
+  if (role === "admin" && !Object.entries(users).some(([id, row]) => id !== uid && isActiveAdministrator(row))) {
+    throw new AccountError("At least one active administrator must remain.", 409, "LAST_ACTIVE_ADMIN");
+  }
+  return { user, role };
+}
+
 function createAccountService({ database, auth, pins, cache = () => {}, now = () => new Date().toISOString() }) {
   if (!database || !auth) throw new AccountError("Account saving is unavailable. Please contact your administrator.", 503, "FIREBASE_ADMIN_REQUIRED");
 
@@ -201,44 +220,59 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
     return result;
   }
 
-  async function remove(uidValue, actor) {
+  async function deletionTarget(uidValue, actor) {
     if (actor?.role !== "admin") {
       throw new AccountError("Only administrators can delete clinic accounts.", 403);
     }
     const uid = accountId(uidValue);
-    if (uid === actor.uid) {
-      throw new AccountError("You cannot delete the account currently signed in.", 403);
+    return { uid, ...removableAccount((await database.ref("users").get()).val(), uid) };
+  }
+
+  async function remove(uidValue, actor) {
+    const { uid, user, role } = await deletionTarget(uidValue, actor);
+    const staff = (await database.ref(`staff/${uid}`).get()).val() || {};
+    const event = audit(actor, uid, "staff_account_deleted", now());
+
+    if (role === "admin") {
+      // Disable the target and count the remaining admins in the same transaction.
+      // A failed Auth cleanup can be retried by one of those admins.
+      let blocked;
+      const hold = await database.ref("users").transaction(users => {
+        // The realtime client may initially call a transaction with no cached value.
+        if (users === null) return null;
+        try {
+          const candidate = removableAccount(users, uid).user;
+          if (!isActiveAdministrator(users[actor.uid])) {
+            throw new AccountError("Sign in as an active administrator to continue.", 403, "ADMIN_REQUIRED");
+          }
+          return { ...users, [uid]: { ...candidate, active: false, accountDeletionPending: candidate.accountDeletionPending || event.id } };
+        } catch (error) {
+          blocked = error;
+          return undefined;
+        }
+      });
+      const pending = hold.snapshot.val()?.[uid]?.accountDeletionPending;
+      if (!hold.committed || !pending) throw blocked || new AccountError("Unable to reserve account deletion. Try again.", 409);
+      event.id = pending;
     }
 
-    const [userSnapshot, staffSnapshot] = await Promise.all([
-      database.ref(`users/${uid}`).get(),
-      database.ref(`staff/${uid}`).get(),
-    ]);
-    const user = userSnapshot.val();
-    const staff = staffSnapshot.val() || {};
-    if (!user) throw new AccountError("Account not found. Refresh the account list.", 404, "ACCOUNT_NOT_FOUND");
-    const role = String(user.role || staff.accountRole || staff.role || "").toLowerCase();
-    if (!['staff', 'doctor', 'nurse', 'receptionist'].includes(role)) {
-      throw new AccountError("Administrator accounts cannot be deleted.", 403, "ACCOUNT_DELETE_PROTECTED");
-    }
-
-    const timestamp = now();
-    const event = audit(actor, uid, "staff_account_deleted", timestamp);
     try {
       await auth.deleteUser(uid);
     } catch (error) {
-      if (error.code === "auth/user-not-found") {
+      if (error.code !== "auth/user-not-found") throw error;
+      if (role !== "admin") {
         throw new AccountError("The sign-in account was already removed. Refresh the account list.", 404, "ACCOUNT_NOT_FOUND");
       }
-      throw error;
     }
 
     try {
-      await database.ref().update({
+      const updates = {
         [`users/${uid}`]: null,
         [`staff/${uid}`]: null,
         [`auditLogs/${event.id}`]: event,
-      });
+      };
+      if (pins) updates[pins.recordPath({ uid, authProviderId: "password" })] = null;
+      await database.ref().update(updates);
     } catch {
       throw new AccountError("The sign-in was removed, but the account profile could not be cleared. Ask an administrator to refresh and finish cleanup.", 503, "ACCOUNT_DELETE_CLEANUP_REQUIRED");
     }
@@ -251,7 +285,7 @@ function createAccountService({ database, auth, pins, cache = () => {}, now = ()
     return { publicId: user.publicId || staff.publicId || "", userId: uid };
   }
 
-  return { create, remove, update };
+  return { create, deletionTarget, remove, update };
 }
 
 module.exports = { AccountError, accountType, requireAdministrator, createAccountService };

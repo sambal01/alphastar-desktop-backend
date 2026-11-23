@@ -249,17 +249,44 @@ test("deleting a clinic account removes its Auth sign-in and profile but retains
   assert.equal(audit.targetId, targetId);
 });
 
-test("account deletion protects administrator and signed-in accounts", async () => {
+test("account deletion protects the last active administrator", async () => {
   const f = fixture(savedAccount("admin", "other_admin"), {
     authAccounts: {
       other_admin: { uid: "other_admin", email: "existing@example.invalid" },
     },
   });
   await assert.rejects(f.service.remove("other_admin", administrator), {
-    code: "ACCOUNT_DELETE_PROTECTED",
+    code: "LAST_ACTIVE_ADMIN",
   });
   await assert.rejects(f.service.remove(administrator.uid, administrator));
   assert.equal(f.authCalls.length, 0);
+});
+
+test("an administrator can delete their own account while another remains active", async () => {
+  const first = savedAccount("admin", administrator.uid);
+  const second = savedAccount("admin", "other_admin");
+  const f = fixture({ users: { ...first.users, ...second.users }, staff: { ...first.staff, ...second.staff } }, {
+    authAccounts: { ...existingAuth(administrator.uid), ...existingAuth("other_admin") },
+  });
+  assert.equal((await f.service.deletionTarget(administrator.uid, administrator)).role, "admin");
+  assert.equal((await f.service.remove(administrator.uid, administrator)).userId, administrator.uid);
+  assert.equal(f.read(`users/${administrator.uid}`), null);
+  assert.deepEqual(f.read("users/other_admin"), second.users.other_admin);
+});
+
+test("concurrent admin deletions leave one active administrator", async () => {
+  const first = savedAccount("admin", administrator.uid);
+  const second = savedAccount("admin", "other_admin");
+  const f = fixture({ users: { ...first.users, ...second.users }, staff: { ...first.staff, ...second.staff } }, {
+    authAccounts: { ...existingAuth(administrator.uid), ...existingAuth("other_admin") },
+  });
+  const results = await Promise.allSettled([
+    f.service.remove(administrator.uid, administrator),
+    f.service.remove("other_admin", { ...administrator, uid: "other_admin" }),
+  ]);
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  assert.equal(results.find(result => result.status === "rejected").reason.code, "LAST_ACTIVE_ADMIN");
+  assert.equal(Object.values(f.read("users")).filter(user => user?.role === "admin" && user.active !== false).length, 1);
 });
 
 test("registration ignores caller-provided account identity, access overrides, and security material", async () => {
