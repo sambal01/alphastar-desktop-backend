@@ -33,3 +33,7 @@ services:
         sync: false
       - key: BREVO_API_KEY
         sync: false
+      - key: CLINICAL_FILE_STORAGE
+        value: firestore
+      - key: CLINICAL_WORKFLOWS_ENABLED
+        value: "false"

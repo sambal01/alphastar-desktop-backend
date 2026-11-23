@@ -231,7 +231,7 @@ test("public confirmation is sanitized, partial updates preserve fields, and no-
   assert.equal(Object.keys(state.root.auditLogs).length, 1);
 });
 
-test("deletion is Admin-only, retryable, and retains stock movement history", async t => {
+test("Admin deletion is retryable and retains stock movement history", async t => {
   const { state, request } = await fixture(t), history = structuredClone(state.root.stockTransactions);
   const response = await request(null, "administrator", "MED-001", "DELETE");
   assert.deepEqual(await response.json(), { ok: true, id: "MED-001" });

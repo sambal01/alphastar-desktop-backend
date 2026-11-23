@@ -11,6 +11,9 @@ const { registerQueueRoutes, createStaffAccessGuard } = require("./queue-routes"
 const { registerSmpeRoutes } = require("./smpe-routes");
 const { registerPatientRecordRoutes } = require("./patient-record-routes");
 const { registerInventoryRoutes } = require("./inventory-routes");
+const { registerSupplyRoutes } = require("./supply-routes");
+const { registerClinicalRoutes } = require("./clinical-records");
+const { registerDesktopNotificationRoutes } = require("./desktop-notification-routes");
 const { registerSyncRoutes } = require("./sync-routes");
 const { registerHumanChatRoutes } = require("./human-chat");
 const { createPatientAuthenticatorAccess } = require("./patient-authenticator-access");
@@ -3404,9 +3407,16 @@ app.use(["/api/staff/accounts", "/api/staff/patient-accounts", "/api/staff-auth/
 
 app.get("/api/ready/firebase", createFirebaseReadiness({ getFirebaseApp: firebaseAdminApp, getDatabase, getFirestore: getBackendFirestore }));
 
+const clinicalWorkflowsAvailable = process.env.CLINICAL_WORKFLOWS_ENABLED === "true";
+
+app.get("/api/ready", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({ ok: true, service: "alphastar-desktop-backend", clinicalRecords: clinicalWorkflowsAvailable ? 1 : 0, clinicalWorkflow: clinicalWorkflowsAvailable ? 3 : 0, clinicalMultiService: clinicalWorkflowsAvailable, clinicalVisitHistoryReports: clinicalWorkflowsAvailable, otpEmailConfigured: emailReady() });
+});
+
 app.get("/api/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { desktopPasswordResetLink: desktopResetLinkFallbackEnabled ? 1 : 0, staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1 } });
+  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { desktopPasswordResetLink: desktopResetLinkFallbackEnabled ? 1 : 0, staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1, supplyInventory: 1, desktopNotifications: 1 } });
 });
 
 app.post("/api/auth/account-status", async (req, res) => {
@@ -4440,6 +4450,11 @@ registerQueueRoutes(app, { getFirebaseApp: firebaseAdminApp });
 registerSmpeRoutes(app);
 registerPatientRecordRoutes(app, { verifyPatientUid: uid => getAuth(firebaseAdminApp()).getUser(uid) });
 registerInventoryRoutes(app);
+registerSupplyRoutes(app);
+if (clinicalWorkflowsAvailable) {
+  registerClinicalRoutes(app, { getFirebaseApp: firebaseAdminApp, getFirestore: getBackendFirestore, assertAuthenticatorAccess: patientAuthenticatorAccess.assertAccess });
+}
+registerDesktopNotificationRoutes(app, { getFirestore: () => getBackendFirestore(firebaseAdminApp()) });
 registerSyncRoutes(app, { getFirebaseApp: firebaseAdminApp, assertAuthenticatorAccess: patientAuthenticatorAccess.assertAccess });
 registerHumanChatRoutes(app, { getFirebaseApp: firebaseAdminApp });
 
