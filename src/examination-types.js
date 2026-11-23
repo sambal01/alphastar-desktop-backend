@@ -12,6 +12,6 @@ function validateExaminationType(value) {
 }
 const commonPersonalFields=["lastName","firstName","middleName","sex","age","dateOfBirth","placeOfBirth","civilStatus","religion","emailAddress","contactNumber","relationship"];
 function personalFields(type) {
-  return commonPersonalFields.concat(type==="mape"?["companyOccupation","emergencyContactName","emergencyContactNumber"]:["school","guardianName","guardianContactNumber"]);
+  return commonPersonalFields.concat(type==="mape"?["presentAddress","requestedBy","lastMenstrualPeriod","companyOccupation","emergencyContactName","emergencyContactNumber"]:["school","guardianName","guardianContactNumber"]);
 }
 module.exports={TYPES,examinationType,validateExaminationType,personalFields};

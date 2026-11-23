@@ -28,8 +28,8 @@ function revision(record) {
 function submittedAt(record) {
   return String(record?.submittedAt || record?.recordedAt || record?.createdAt || "");
 }
-function isSmpe(record) {
-  return record?.patientSubmitted === true && record.recordType === "patient_medical_record" && Boolean(examinationType(record)) && !record.deleted && !record.deletedAt;
+function isSmpe(record, includeClinicEntered = false) {
+  return (record?.patientSubmitted === true || includeClinicEntered && record?.clinicEntered === true) && record.recordType === "patient_medical_record" && Boolean(examinationType(record)) && !record.deleted && !record.deletedAt;
 }
 function values(history) {
   return Array.isArray(history) ? history.filter(Boolean) : Object.values(history || {});
@@ -39,11 +39,13 @@ function finished(record) {
 }
 function snapshot(record) {
   const copy = {};
-  for (const key of ["id", "userId", "medicalRecordId", "title", "recordType", "patientSubmitted", "source", "createdAt", "updatedAt", "status", "staffRemarks", "reviewedAt", "reviewedBy", "reviewerName", "lastEditedAt", "lastEditedBy", "lastEditorName", "lastEditReason"]) {
+  for (const key of ["id", "userId", "clinicRecordId", "clinicEntered", "createdBy", "firstApprovedAt", "medicalRecordId", "title", "recordType", "patientSubmitted", "source", "createdAt", "updatedAt", "status", "staffRemarks", "reviewedAt", "reviewedBy", "reviewerName", "lastEditedAt", "lastEditedBy", "lastEditorName", "lastEditReason"]) {
     if (record[key] !== undefined) copy[key] = record[key];
   }
   for (const key of SECTIONS) copy[key] = JSON.parse(JSON.stringify(record[key] || {}));
   copy.examinationType = examinationType(record);
+  if (record.patientPhoto) copy.patientPhoto = record.patientPhoto;
+  if (record.schoolIdPhoto) copy.schoolIdPhoto = record.schoolIdPhoto;
   copy.revision = revision(record);
   copy.submittedAt = submittedAt(record);
   return copy;
@@ -229,6 +231,7 @@ async function mutateSmpe(database, apply) {
   return result;
 }
 function registerSmpeRoutes(app, options = {}) {
+  require("./staff-medical-forms").register(app, options);
   app.patch("/api/staff/medical-records/:recordId/assessment", async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
@@ -257,4 +260,7 @@ function registerSmpeRoutes(app, options = {}) {
     }
   });
 }
-module.exports = { registerSmpeRoutes, submitSmpe, mutateSmpe, __test: { approveSmpe, updateSmpe, submitSmpe, revision, submittedAt, snapshot, SmpeError, EDIT_FIELDS } };
+module.exports = { registerSmpeRoutes, submitSmpe, mutateSmpe, staffFormSupport: {
+  revision, submittedAt, snapshot, SmpeError, savedActor, keepCompleted, finished,
+  isSmpe: record => isSmpe(record, true) && Boolean(record.userId) !== Boolean(record.clinicRecordId),
+}, __test: { approveSmpe, updateSmpe, submitSmpe, revision, submittedAt, snapshot, SmpeError, EDIT_FIELDS } };
