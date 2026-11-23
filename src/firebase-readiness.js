@@ -1,13 +1,19 @@
-// Read-only probes for deployment. No record contents are returned.
-const CACHE_MS = 30_000;
-const TIMEOUT_MS = 3_000;
+const SUCCESS_REFRESH_MS = 30_000;
+const FAILURE_RETRY_MS = 5_000;
+const PROBE_TIMEOUT_MS = 20_000;
+
+const unavailable = {
+  ok: false,
+  realtimeDatabase: false,
+  firestore: false,
+};
 
 async function reachable(read) {
   let timer;
   try {
     return await Promise.race([
       Promise.resolve().then(read).then(() => true, () => false),
-      new Promise(resolve => { timer = setTimeout(() => resolve(false), TIMEOUT_MS); }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MS); }),
     ]);
   } finally {
     clearTimeout(timer);
@@ -15,32 +21,48 @@ async function reachable(read) {
 }
 
 function createFirebaseReadiness({ getFirebaseApp, getDatabase, getFirestore }) {
-  let cached;
-  let expiresAt = 0;
-  let pending;
+  let result;
+  let nextProbeAt = 0;
+  let probePending = false;
 
-  async function check() {
+  async function checkFirebase() {
     const app = getFirebaseApp();
-    const [realtimeDatabase, firestore] = app ? await Promise.all([
+    if (!app) return unavailable;
+
+    const [realtimeDatabase, firestore] = await Promise.all([
       reachable(() => getDatabase(app).ref("clinicSettings/availability").get()),
       reachable(() => getFirestore(app).doc("_alphastarReadiness/connection").get()),
-    ]) : [false, false];
+    ]);
     return { ok: realtimeDatabase && firestore, realtimeDatabase, firestore };
   }
 
-  return async function firebaseReadiness(_req, res) {
-    res.set("Cache-Control", "no-store");
-    if (!cached || Date.now() >= expiresAt) {
-      pending ||= check()
-        .catch(() => ({ ok: false, realtimeDatabase: false, firestore: false }))
-        .then(result => {
-          cached = result;
-          expiresAt = Date.now() + CACHE_MS;
-          pending = null;
-        });
-      await pending;
+  async function refreshReadiness() {
+    const latest = await checkFirebase().catch(() => unavailable);
+    const stateChanged = result?.realtimeDatabase !== latest.realtimeDatabase
+      || result?.firestore !== latest.firestore;
+    if (stateChanged && !latest.ok) {
+      console.warn("Firebase readiness check failed.", {
+        realtimeDatabase: latest.realtimeDatabase,
+        firestore: latest.firestore,
+      });
+    } else if (stateChanged && result && latest.ok) {
+      console.info("Firebase readiness restored.");
     }
-    return res.status(cached.ok ? 200 : 503).json(cached);
+    result = latest;
+    nextProbeAt = Date.now() + (result.ok ? SUCCESS_REFRESH_MS : FAILURE_RETRY_MS);
+    probePending = false;
+  }
+
+  return function firebaseReadiness(_req, res) {
+    // Render gives each request five seconds. Keep slow SDK startup off the response path.
+    if (!probePending && Date.now() >= nextProbeAt) {
+      probePending = true;
+      setImmediate(refreshReadiness);
+    }
+
+    const current = result || unavailable;
+    res.set("Cache-Control", "no-store");
+    return res.status(current.ok ? 200 : 503).json(current);
   };
 }
 
