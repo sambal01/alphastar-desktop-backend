@@ -16,7 +16,7 @@ services:
       - key: FIREBASE_DATABASE_URL
         sync: false
       - key: FIREBASE_API_KEY
-        sync: false
+        value: "AIzaSyDovlYRntcWR9RbPRVE3Bvtj_zxy14houI"
       - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: STAFF_ACCOUNT_PIN_ENABLED
