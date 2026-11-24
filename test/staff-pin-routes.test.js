@@ -4,9 +4,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
+const { recordDesktopSystemEvent } = require("../src/desktop-auth-audit");
 const source = fs.readFileSync(path.join(__dirname, "../src/server.js"), "utf8");
 function runtime() {
-  const routes = new Map(), calls = [];
+  const routes = new Map(), calls = [], events = new Map();
+  const database = { ref: (path) => ({ set: async (row) => events.set(path, row) }) };
   const pins = {
     status: async account => { calls.push(["status", account]); return { configured: true }; },
     create: async (...args) => { calls.push(["create", ...args]); },
@@ -21,7 +23,7 @@ function runtime() {
     app: { post: (route, handler) => routes.set(route, handler) }, process: { env: {} }, Date,
     staffRoles: new Set(["admin", "staff", "doctor", "nurse", "receptionist"]),
     createFirebaseCustomToken: async uid => { calls.push(["token", uid]); return "synthetic-token"; },
-    actorFromRequest: req => ({ ...req.staffAccess.actor, email: req.staffAccess.decoded.email }),
+    recordDesktopSystemEvent,
     id: prefix => prefix + "-test", firebaseAdminApp: () => ({}),
     sendError: (res, error) => res.status(error.status || 503).json({ ok: false, code: error.code, error: error.message }),
     sendMail: () => assert.fail("Normal PIN sign-in must never send email"),
@@ -32,12 +34,12 @@ function runtime() {
   context.desktopPins.service = pins;
   async function request(route, body = {}, access = { actor: { uid: "canonical-admin", role: "admin" },
     decoded: { email: "admin@example.invalid", auth_time: Date.now() / 1000 } }) {
-    const req = { body, staffAccess: access }; let result, status = 200;
+    const req = { body, staffAccess: access && { database, ...access } }; let result, status = 200;
     const res = { set() {}, status(code) { status = code; return res; }, json(value) { result = value; } };
     await routes.get("/api/staff-auth/" + route)(req, res);
     return { status, result };
   }
-  return { request, calls, pins };
+  return { request, calls, pins, events, context };
 }
 test("PIN status and correct PIN sign-in never send an email or create an OTP challenge", async () => {
   const r = runtime();
@@ -104,4 +106,48 @@ test("new account creation requires an emailed proof separately from the saved s
   assert.match(create, /expectedMetadata: \{ adminUid: actor.uid, accountType: type \}/);
   assert.doesNotMatch(create, /sendMail\(/);
   assert.match(create, /service\.create/);
+});
+
+test("verified sign-ins append separate shared audit rows for different clinic accounts and PCs", async () => {
+  const runtimeFixture = runtime();
+  const accounts = [
+    { uid: "admin-test", role: "admin", name: "Test Admin" },
+    { uid: "staff-test", role: "staff", name: "Test Staff" },
+    { uid: "doctor-test", role: "staff", name: "Test Doctor", doctor: true },
+  ];
+  for (const [index, { uid, role, name, doctor }] of accounts.entries()) {
+    const access = { actor: { uid, role }, decoded: { email: uid + "@example.test" }, auditIdentity: { name, doctor } };
+    const response = await runtimeFixture.request("verify", { pin: "012345", uid: "spoofed", deviceId: "pc-" + index }, access);
+    assert.equal(response.status, 200);
+  }
+  const rows = [...runtimeFixture.events.values()];
+  assert.deepEqual(rows.map((row) => row.actorId), accounts.map((account) => account.uid));
+  assert.deepEqual(rows.map((row) => row.actorRole), ["admin", "staff", "doctor"]);
+  assert.deepEqual(rows.map((row) => row.actorName), accounts.map((account) => account.name));
+  assert.deepEqual([...runtimeFixture.events.keys()], rows.map((row) => "auditLogs/" + row.id));
+  assert.ok(rows.every((row) => row.source === "desktop" && row.action === "desktop_login" && row.status === "success"));
+  assert.doesNotMatch(JSON.stringify(rows), /012345|synthetic-token|spoofed|pc-0/);
+});
+
+test("PIN checks and rejected or unfinished sign-ins stay out of successful Desktop Logins", async () => {
+  const runtimeFixture = runtime();
+  assert.equal((await runtimeFixture.request("verify", { pin: "012345", flow: "unlock" })).status, 200);
+  assert.equal((await runtimeFixture.request("verify", { pin: "123456" })).status, 400);
+  runtimeFixture.context.createFirebaseCustomToken = async () => { throw new Error("Token service unavailable"); };
+  assert.equal((await runtimeFixture.request("verify", { pin: "012345" })).status, 503);
+  const events = [...runtimeFixture.events.values()];
+  assert.deepEqual(events.map((event) => [event.action, event.status]), [["desktop_pin_verified", "success"], ["desktop_pin_failed", "failed"]]);
+});
+
+test("a failed audit write does not prevent a verified sign-in", async (t) => {
+  t.mock.method(console, "warn", () => {});
+  const runtimeFixture = runtime();
+  const access = {
+    actor: { uid: "staff-test", role: "staff" }, decoded: {},
+    database: { ref: () => ({ set: async () => { throw new Error("Audit storage unavailable"); } }) },
+  };
+  const result = await runtimeFixture.request("verify", { pin: "012345" }, access);
+  assert.equal(result.status, 200);
+  assert.equal(result.result.customToken, "synthetic-token");
+  assert.equal(console.warn.mock.callCount(), 1);
 });

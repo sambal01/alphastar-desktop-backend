@@ -19,6 +19,7 @@ const { registerHumanChatRoutes } = require("./human-chat");
 const { createPatientAuthenticatorAccess } = require("./patient-authenticator-access");
 const { accountType: desktopAccountType, requireAdministrator, createAccountService } = require("./account-service");
 const { createStaffAccountPin } = require("./staff-account-pin");
+const { recordDesktopSystemEvent } = require("./desktop-auth-audit");
 const { cert, getApp, getApps, initializeApp } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getDatabase } = require("firebase-admin/database");
@@ -3420,7 +3421,7 @@ app.get("/api/ready", async (req, res) => {
 
 app.get("/api/health", (_req, res) => {
   res.set("Cache-Control", "no-store");
-  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { desktopPasswordResetLink: desktopResetLinkFallbackEnabled ? 1 : 0, staffAccountPin: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1, supplyInventory: 1, desktopNotifications: 1 } });
+  res.json({ ok: true, service: "alphastar-desktop-backend", capabilities: { desktopPasswordResetLink: desktopResetLinkFallbackEnabled ? 1 : 0, staffAccountPin: 1, desktopSignInAudit: 1, staffPinRecovery: 1, staffAccountVerification: 1, inventoryManagement: 1, supplyInventory: 1, desktopNotifications: 1 } });
 });
 
 app.post("/api/auth/account-status", async (req, res) => {
@@ -3897,9 +3898,18 @@ app.post("/api/staff-auth/pin/create", async (req, res) => {
 app.post("/api/staff-auth/verify", async (req, res) => {
   res.set("Cache-Control", "no-store");
   try {
-    const actor = actorFromRequest(req);
-    await desktopPins().verify(pinAccount(req), req.body.pin);
-    const customToken = await createFirebaseCustomToken(actor.uid, { source: "desktop" });
+    const account = pinAccount(req);
+    try {
+      await desktopPins().verify(account, req.body.pin);
+    } catch (error) {
+      if (["STAFF_PIN_INCORRECT", "STAFF_PIN_LOCKED"].includes(error?.code)) {
+        await recordDesktopSystemEvent(req.staffAccess, "desktop_pin_failed");
+      }
+      throw error;
+    }
+    const customToken = await createFirebaseCustomToken(account.uid, { source: "desktop" });
+    const event = req.body.flow === "unlock" ? "desktop_pin_verified" : "desktop_login";
+    await recordDesktopSystemEvent(req.staffAccess, event);
     res.json({ customToken: customToken || undefined, deviceId: req.body.deviceId || id("device"), ok: true, sessionId: id("session") });
   } catch (error) { sendError(res, error); }
 });
@@ -4046,7 +4056,8 @@ app.post("/api/staff-auth/session/renew", (req, res) => {
     .catch((error) => sendError(res, error));
 });
 
-app.post("/api/staff-auth/session/logout", (_req, res) => {
+app.post("/api/staff-auth/session/logout", async (req, res) => {
+  await recordDesktopSystemEvent(req.staffAccess, "desktop_logout");
   res.json({ ok: true });
 });
 

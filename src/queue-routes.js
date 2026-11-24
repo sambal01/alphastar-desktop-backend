@@ -395,7 +395,13 @@ function queueAccess(options) {
     const roles = [user.role || user.accountRole || staff.accountRole || staff.role].map((value) => String(value || "").trim().toLowerCase());
     const isStaff = Boolean(userSnap.val()) && roles.some((role) => STAFF_ROLES.has(role));
     if (staffOnly && !isStaff) throw new QueueError("Only clinic staff can perform this action.", 403, "QUEUE_FORBIDDEN");
-    return { database, decoded, actor: { uid: decoded.uid, role: isStaff ? roles.find((role) => STAFF_ROLES.has(role)) || "admin" : "patient" } };
+    const role = isStaff ? roles.find((value) => STAFF_ROLES.has(value)) || "admin" : "patient";
+    const accountType = clean(staff.accountType || staff.jobTitle || user.accountType || user.jobTitle).toLowerCase();
+    const auditIdentity = staffOnly ? {
+      name: clean(staff.name || staff.fullName || staff.displayName || user.fullName || user.name || user.displayName || decoded.name),
+      doctor: accountType === "doctor" || accountType.includes("physician"),
+    } : undefined;
+    return { database, decoded, actor: { uid: decoded.uid, role }, auditIdentity };
   }
   return context;
 }
